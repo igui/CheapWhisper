@@ -122,18 +122,24 @@ val COST_PROVIDERS = listOf(
 
 /** Estimates USD cost (returned as integer micro-dollars to avoid float drift). */
 object CostEstimator {
-    fun transcriptionMicros(provider: String, audioDurationSec: Double): Long {
-        // Published pay-as-you-go rates, USD per minute of audio (June 2026).
-        val usdPerMin = when (provider) {
-            PROVIDER_OPENAI -> 0.006
-            PROVIDER_GROQ -> 0.04 / 60.0          // $0.04/hr
-            PROVIDER_DEEPGRAM -> 0.0077
-            PROVIDER_ELEVENLABS -> 0.40 / 60.0    // $0.40/hr
-            PROVIDER_ASSEMBLYAI -> 0.27 / 60.0    // $0.27/hr
-            else -> 0.0
-        }
-        return Math.round(usdPerMin * (audioDurationSec / 60.0) * 1_000_000)
+    /** Published pay-as-you-go transcription rate, USD per minute (0 for on-device). */
+    fun usdPerMinute(provider: String): Double = when (provider) {
+        PROVIDER_OPENAI -> 0.006
+        PROVIDER_GROQ -> 0.04 / 60.0          // $0.04/hr
+        PROVIDER_DEEPGRAM -> 0.0077
+        PROVIDER_ELEVENLABS -> 0.40 / 60.0    // $0.40/hr
+        PROVIDER_ASSEMBLYAI -> 0.27 / 60.0    // $0.27/hr
+        else -> 0.0
     }
+
+    /** Human-readable per-minute estimate, e.g. "$0.0077/min" (or "free" on-device). */
+    fun formatPerMin(provider: String): String {
+        val rate = usdPerMinute(provider)
+        return if (rate <= 0.0) "free" else "$" + String.format("%.4f", rate) + "/min"
+    }
+
+    fun transcriptionMicros(provider: String, audioDurationSec: Double): Long =
+        Math.round(usdPerMinute(provider) * (audioDurationSec / 60.0) * 1_000_000)
 
     /** OpenAI gpt-4o-mini text cleanup, priced from returned token usage. */
     fun llmMicros(promptTokens: Int, completionTokens: Int): Long {
@@ -161,7 +167,12 @@ class UsageTracker(context: Context) {
     fun reset() = prefs.edit().clear().apply()
 
     companion object {
-        fun formatUsd(micros: Long): String = "$" + String.format("%.4f", micros / 1_000_000.0)
+        // Rounded to cents. Non-zero amounts under a cent show as "< $0.01".
+        fun formatUsd(micros: Long): String = when {
+            micros <= 0L -> "$0.00"
+            micros < 10_000L -> "< $0.01"   // 1 cent == 10,000 micro-USD
+            else -> "$" + String.format("%.2f", micros / 1_000_000.0)
+        }
     }
 }
 
@@ -284,16 +295,19 @@ class SecureStorage(context: Context) {
 
 @Composable
 private fun CostBreakdownDialog(tracker: UsageTracker, onDismiss: () -> Unit) {
-    val rows = tracker.byProvider()
-    val total = rows.sumOf { it.second }
+    val total = tracker.totalMicros()
+    val rows = tracker.byProvider().filter { it.second > 0L }  // omit providers with no usage
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Usage cost by provider") },
         text = {
             Column {
+                if (rows.isEmpty()) {
+                    Text("No usage yet.", style = MaterialTheme.typography.bodyMedium)
+                }
                 rows.forEach { (provider, micros) ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(provider)
+                        Text("$provider  (${CostEstimator.formatPerMin(provider)})")
                         Text(UsageTracker.formatUsd(micros))
                     }
                 }
@@ -397,7 +411,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             TRANSCRIPTION_PROVIDERS.forEach { choice ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     RadioButton(selected = modelChoice == choice, onClick = { modelChoice = choice })
-                    Text(choice)
+                    Text("$choice  •  est. ${CostEstimator.formatPerMin(choice)}")
                 }
             }
 
@@ -492,9 +506,13 @@ fun SettingsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(16.dp))
 
             Text("Usage Cost (third parties)", style = MaterialTheme.typography.titleMedium)
-            usageTracker.byProvider().forEach { (provider, micros) ->
+            val usageRows = usageTracker.byProvider().filter { it.second > 0L }  // omit no-usage providers
+            if (usageRows.isEmpty()) {
+                Text("No usage yet.", style = MaterialTheme.typography.bodyMedium)
+            }
+            usageRows.forEach { (provider, micros) ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(provider, style = MaterialTheme.typography.bodyMedium)
+                    Text("$provider  (${CostEstimator.formatPerMin(provider)})", style = MaterialTheme.typography.bodyMedium)
                     Text(UsageTracker.formatUsd(micros), style = MaterialTheme.typography.bodyMedium)
                 }
             }

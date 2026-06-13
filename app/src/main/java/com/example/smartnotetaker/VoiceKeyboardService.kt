@@ -101,10 +101,14 @@ class VoiceKeyboardService : InputMethodService() {
 
     /** Updates the bottom-right total and the expanded per-provider breakdown. */
     private fun refreshCostViews(costButton: TextView, breakdown: TextView) {
-        costButton.text = UsageTracker.formatUsd(usageTracker.totalMicros())
-        breakdown.text = usageTracker.byProvider()
-            .joinToString("\n") { (provider, micros) -> "$provider: ${UsageTracker.formatUsd(micros)}" } +
-            "\n—\nTotal: ${UsageTracker.formatUsd(usageTracker.totalMicros())}"
+        val total = usageTracker.totalMicros()
+        costButton.text = UsageTracker.formatUsd(total)
+        val rows = usageTracker.byProvider().filter { it.second > 0L }  // omit no-usage providers
+        val lines = if (rows.isEmpty()) "No usage yet."
+        else rows.joinToString("\n") { (provider, micros) ->
+            "$provider (${CostEstimator.formatPerMin(provider)}): ${UsageTracker.formatUsd(micros)}"
+        }
+        breakdown.text = "$lines\n—\nTotal: ${UsageTracker.formatUsd(total)}"
     }
 
     @SuppressLint("ClickableViewAccessibility")
