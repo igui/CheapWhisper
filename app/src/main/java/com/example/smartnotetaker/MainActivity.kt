@@ -405,22 +405,13 @@ fun SettingsScreen(onBack: () -> Unit) {
 
             Text("Transcription Language", style = MaterialTheme.typography.titleMedium)
             val selectedLangLabel = TRANSCRIBE_LANGUAGES.firstOrNull { it.second == transcribeLanguage }?.first ?: "Auto-detect"
-            ExposedDropdownMenuBox(
-                expanded = langExpanded,
-                onExpandedChange = { langExpanded = !langExpanded }
-            ) {
-                OutlinedTextField(
-                    value = selectedLangLabel,
-                    onValueChange = {},
-                    readOnly = true,
-                    label = { Text("Language") },
-                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = langExpanded) },
-                    modifier = Modifier.fillMaxWidth().menuAnchor()
-                )
-                ExposedDropdownMenu(
-                    expanded = langExpanded,
-                    onDismissRequest = { langExpanded = false }
-                ) {
+            // Plain button + popup menu: a DropdownMenu doesn't track its anchor on
+            // every scroll frame the way ExposedDropdownMenuBox does (that caused jank).
+            Box {
+                OutlinedButton(onClick = { langExpanded = true }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Language: $selectedLangLabel")
+                }
+                DropdownMenu(expanded = langExpanded, onDismissRequest = { langExpanded = false }) {
                     TRANSCRIBE_LANGUAGES.forEach { (label, code) ->
                         DropdownMenuItem(
                             text = { Text(label) },
