@@ -69,6 +69,10 @@ const val PROVIDER_LOCAL_TINY = "Local (tiny)"
 const val PROVIDER_LOCAL_BASE = "Local (base)"
 const val PROVIDER_LOCAL_SMALL = "Local (small)"
 
+// Cleanup/modify LLM spend is metered into its own bucket, separate from any
+// same-vendor transcription spend (so OpenAI transcription vs. cleanup are distinct lines).
+const val PROVIDER_LLM = "OpenAI (cleanup LLM)"
+
 val TRANSCRIPTION_PROVIDERS = listOf(
     PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI,
     PROVIDER_LOCAL_TINY, PROVIDER_LOCAL_BASE, PROVIDER_LOCAL_SMALL,
@@ -118,10 +122,21 @@ data class ApiKeys(
 // on-device and cost nothing, so they are intentionally excluded.
 val COST_PROVIDERS = listOf(
     PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI,
+    PROVIDER_LLM,
 )
 
 /** Estimates USD cost (returned as integer micro-dollars to avoid float drift). */
 object CostEstimator {
+    // gpt-4o-mini token pricing (USD per token).
+    private const val GPT4O_MINI_IN = 0.15 / 1_000_000
+    private const val GPT4O_MINI_OUT = 0.60 / 1_000_000
+    // ~160 words/min of speech ≈ ~500 tokens/min in; cleanup output is of similar length.
+    private const val LLM_TOKENS_PER_MIN = 500
+
+    /** Estimated cleanup-LLM (gpt-4o-mini) cost per minute of speech. */
+    fun llmUsdPerMinute(): Double =
+        LLM_TOKENS_PER_MIN * GPT4O_MINI_IN + LLM_TOKENS_PER_MIN * GPT4O_MINI_OUT
+
     /** Published pay-as-you-go transcription rate, USD per minute (0 for on-device). */
     fun usdPerMinute(provider: String): Double = when (provider) {
         PROVIDER_OPENAI -> 0.006
@@ -129,8 +144,13 @@ object CostEstimator {
         PROVIDER_DEEPGRAM -> 0.0077
         PROVIDER_ELEVENLABS -> 0.40 / 60.0    // $0.40/hr
         PROVIDER_ASSEMBLYAI -> 0.27 / 60.0    // $0.27/hr
+        PROVIDER_LLM -> llmUsdPerMinute()
         else -> 0.0
     }
+
+    /** Cleanup-model picker label: FREE on-device, else the per-minute LLM estimate. */
+    fun llmRateLabel(llmChoice: String): String =
+        if (llmChoice == "OpenAI") "est. $" + String.format("%.4f", llmUsdPerMinute()) + "/min" else "FREE"
 
     /** Human-readable per-minute estimate, e.g. "$0.0077/min" (or "free" on-device). */
     fun formatPerMin(provider: String): String {
@@ -138,14 +158,18 @@ object CostEstimator {
         return if (rate <= 0.0) "free" else "$" + String.format("%.4f", rate) + "/min"
     }
 
+    /** Picker label: "FREE" for on-device, otherwise "est. $X/min". */
+    fun rateLabel(provider: String): String {
+        val rate = usdPerMinute(provider)
+        return if (rate <= 0.0) "FREE" else "est. $" + String.format("%.4f", rate) + "/min"
+    }
+
     fun transcriptionMicros(provider: String, audioDurationSec: Double): Long =
         Math.round(usdPerMinute(provider) * (audioDurationSec / 60.0) * 1_000_000)
 
-    /** OpenAI gpt-4o-mini text cleanup, priced from returned token usage. */
-    fun llmMicros(promptTokens: Int, completionTokens: Int): Long {
-        val usd = promptTokens * (0.15 / 1_000_000) + completionTokens * (0.60 / 1_000_000)
-        return Math.round(usd * 1_000_000)
-    }
+    /** Exact OpenAI gpt-4o-mini cost from returned token usage. */
+    fun llmMicros(promptTokens: Int, completionTokens: Int): Long =
+        Math.round((promptTokens * GPT4O_MINI_IN + completionTokens * GPT4O_MINI_OUT) * 1_000_000)
 }
 
 /** Persists cumulative spend per provider (micro-USD) in plain prefs. */
@@ -350,6 +374,8 @@ fun SettingsScreen(onBack: () -> Unit) {
     var modelChoice by remember { mutableStateOf(secureStorage.getModelChoice()) }
     var llmChoice by remember { mutableStateOf(secureStorage.getLlmChoice()) }
     var langExpanded by remember { mutableStateOf(false) }
+    var modelExpanded by remember { mutableStateOf(false) }
+    var llmExpanded by remember { mutableStateOf(false) }
 
     val usageTracker = remember { UsageTracker(context) }
     var costMicros by remember { mutableStateOf(usageTracker.totalMicros()) }
@@ -408,10 +434,20 @@ fun SettingsScreen(onBack: () -> Unit) {
             modifier = Modifier.fillMaxSize().padding(paddingValues).padding(16.dp).verticalScroll(rememberScrollState())
         ) {
             Text("Transcription Model", style = MaterialTheme.typography.titleMedium)
-            TRANSCRIPTION_PROVIDERS.forEach { choice ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(selected = modelChoice == choice, onClick = { modelChoice = choice })
-                    Text("$choice  •  est. ${CostEstimator.formatPerMin(choice)}")
+            Box {
+                OutlinedButton(onClick = { modelExpanded = true }, modifier = Modifier.fillMaxWidth()) {
+                    Text("$modelChoice  •  ${CostEstimator.rateLabel(modelChoice)}")
+                }
+                DropdownMenu(expanded = modelExpanded, onDismissRequest = { modelExpanded = false }) {
+                    TRANSCRIPTION_PROVIDERS.forEach { choice ->
+                        DropdownMenuItem(
+                            text = { Text("$choice  •  ${CostEstimator.rateLabel(choice)}") },
+                            onClick = {
+                                modelChoice = choice
+                                modelExpanded = false
+                            }
+                        )
+                    }
                 }
             }
 
@@ -441,10 +477,20 @@ fun SettingsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(16.dp))
 
             Text("LLM Cleanup Model", style = MaterialTheme.typography.titleMedium)
-            listOf("OpenAI", "Local (Gemma-4 E2B)", "Local (Gemma-4 E4B)").forEach { choice ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(selected = llmChoice == choice, onClick = { llmChoice = choice })
-                    Text(choice)
+            Box {
+                OutlinedButton(onClick = { llmExpanded = true }, modifier = Modifier.fillMaxWidth()) {
+                    Text("$llmChoice  •  ${CostEstimator.llmRateLabel(llmChoice)}")
+                }
+                DropdownMenu(expanded = llmExpanded, onDismissRequest = { llmExpanded = false }) {
+                    listOf("OpenAI", "Local (Gemma-4 E2B)", "Local (Gemma-4 E4B)").forEach { choice ->
+                        DropdownMenuItem(
+                            text = { Text("$choice  •  ${CostEstimator.llmRateLabel(choice)}") },
+                            onClick = {
+                                llmChoice = choice
+                                llmExpanded = false
+                            }
+                        )
+                    }
                 }
             }
 
@@ -1057,7 +1103,7 @@ class AIProcessor {
             val jsonObject = JSONObject(responseBody)
             jsonObject.optJSONObject("usage")?.let { usage ->
                 usageTracker.add(
-                    PROVIDER_OPENAI,
+                    PROVIDER_LLM,
                     CostEstimator.llmMicros(usage.optInt("prompt_tokens"), usage.optInt("completion_tokens")),
                 )
             }
@@ -1095,7 +1141,7 @@ class AIProcessor {
             val jsonObject = JSONObject(responseBody)
             jsonObject.optJSONObject("usage")?.let { usage ->
                 usageTracker.add(
-                    PROVIDER_OPENAI,
+                    PROVIDER_LLM,
                     CostEstimator.llmMicros(usage.optInt("prompt_tokens"), usage.optInt("completion_tokens")),
                 )
             }
