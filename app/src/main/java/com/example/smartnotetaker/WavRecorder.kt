@@ -18,6 +18,11 @@ class WavRecorder(private val context: Context) {
     private var isRecording = false
     private var audioFile: File? = null
 
+    /** Live peak amplitude of the most recent buffer, normalized 0f..1f (for mic-level UI). */
+    @Volatile
+    var amplitude: Float = 0f
+        private set
+
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -44,6 +49,7 @@ class WavRecorder(private val context: Context) {
 
     fun stop(): File? {
         isRecording = false
+        amplitude = 0f
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
@@ -63,8 +69,19 @@ class WavRecorder(private val context: Context) {
             val read = audioRecord?.read(data, 0, bufferSize) ?: 0
             if (read > 0) {
                 os.write(data, 0, read)
+                // Track peak amplitude over this buffer (16-bit little-endian samples).
+                var peak = 0
+                var i = 0
+                while (i + 1 < read) {
+                    val sample = (data[i + 1].toInt() shl 8) or (data[i].toInt() and 0xff)
+                    val abs = if (sample < 0) -sample else sample
+                    if (abs > peak) peak = abs
+                    i += 2
+                }
+                amplitude = (peak / 32768f).coerceIn(0f, 1f)
             }
         }
+        amplitude = 0f
         os.close()
     }
 

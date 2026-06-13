@@ -541,11 +541,14 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
     var modelChoice by remember { mutableStateOf(secureStorage.getModelChoice()) }
     var llmChoice by remember { mutableStateOf(secureStorage.getLlmChoice()) }
 
-    var isRecording by remember { mutableStateOf(false) }
+    // recordMode: null = idle, "write" = dictate & append, "modify" = spoken edit instruction.
+    var recordMode by remember { mutableStateOf<String?>(null) }
     var statusText by remember { mutableStateOf("Ready") }
     var notesText by remember { mutableStateOf("") }
     var downloadProgress by remember { mutableStateOf(0f) }
-    
+    var micLevel by remember { mutableStateOf(0f) }
+    val undoStack = remember { mutableStateListOf<String>() }
+
     val wavRecorder = remember { WavRecorder(context) }
     val aiProcessor = remember { AIProcessor() }
     val modelDownloader = remember { LocalModelDownloader(context) }
@@ -559,6 +562,81 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
     }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
         hasPermission = isGranted
+    }
+
+    // Live mic level while recording (drives the on-screen indicator).
+    LaunchedEffect(recordMode) {
+        while (recordMode != null) {
+            micLevel = wavRecorder.amplitude
+            kotlinx.coroutines.delay(60)
+        }
+        micLevel = 0f
+    }
+
+    fun keysMissing(): Boolean {
+        val needsTranscribeKey = !isLocalProvider(modelChoice) && apiKeys.keyFor(modelChoice).isEmpty()
+        val needsLlmKey = llmChoice == "OpenAI" && apiKeys.openai.isEmpty()
+        return needsTranscribeKey || needsLlmKey
+    }
+
+    fun startRecording(mode: String) {
+        recordMode = mode
+        statusText = if (mode == "write") "Recording…" else "Listening for edit instruction…"
+        wavRecorder.start()
+    }
+
+    // Stops recording and runs the pipeline. Write => transcribe + cleanup + append;
+    // Modify => transcribe (as an edit instruction) + LLM-rewrite the existing notes.
+    fun stopAndProcess() {
+        val mode = recordMode ?: return
+        recordMode = null
+        statusText = "Processing…"
+        val audioFile = wavRecorder.stop() ?: run { statusText = "Ready"; return }
+        coroutineScope.launch {
+            try {
+                val rawText = aiProcessor.transcribe(
+                    choice = modelChoice,
+                    language = transcribeLanguage,
+                    audioFile = audioFile,
+                    wavRecorder = wavRecorder,
+                    modelDownloader = modelDownloader,
+                    keys = apiKeys,
+                    usageTracker = usageTracker,
+                    onStatus = { statusText = it },
+                    onProgress = { p -> downloadProgress = p / 100f },
+                )
+                downloadProgress = 0f
+
+                // Resolve a local LLM only when cleanup/modify runs on-device.
+                val llmFile: File? = if (llmChoice != "OpenAI") {
+                    statusText = "Loading LLM…"
+                    val f = modelDownloader.downloadLlmModel(llmChoice) { p -> downloadProgress = p / 100f }
+                    downloadProgress = 0f
+                    f ?: throw Exception("Failed to load local LLM")
+                } else null
+
+                if (mode == "write") {
+                    statusText = "Cleaning up text…"
+                    val cleanText = if (llmChoice == "OpenAI")
+                        aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker)
+                    else aiProcessor.cleanTextLocal(rawText, llmFile!!)
+                    undoStack.add(notesText)
+                    notesText += if (notesText.isEmpty()) cleanText else "\n\n$cleanText"
+                } else {
+                    statusText = "Applying edit…"
+                    val newText = if (llmChoice == "OpenAI")
+                        aiProcessor.modifyText(notesText, rawText, apiKeys.openai, usageTracker)
+                    else aiProcessor.modifyTextLocal(notesText, rawText, llmFile!!)
+                    undoStack.add(notesText)
+                    notesText = newText.trim()
+                }
+                costMicros = usageTracker.totalMicros()
+                statusText = "Ready"
+            } catch (e: Exception) {
+                statusText = "Error: ${e.message}"
+                Log.e("SmartNoteTaker", "Pipeline failed", e)
+            }
+        }
     }
 
 
@@ -609,22 +687,13 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.height(48.dp)
             ) {
-                if (isRecording) {
-                    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-                    val alpha by infiniteTransition.animateFloat(
-                        initialValue = 0.3f,
-                        targetValue = 1f,
-                        animationSpec = infiniteRepeatable(
-                            animation = tween(800, easing = FastOutSlowInEasing),
-                            repeatMode = RepeatMode.Reverse
-                        ),
-                        label = "alpha"
-                    )
+                if (recordMode != null) {
+                    // Live mic-level: the icon grows with the captured audio amplitude.
                     Icon(
-                        imageVector = Icons.Filled.Mic, 
-                        contentDescription = "Recording", 
-                        tint = Color.Red.copy(alpha = alpha),
-                        modifier = Modifier.size(32.dp)
+                        imageVector = Icons.Filled.Mic,
+                        contentDescription = "Recording",
+                        tint = Color.Red,
+                        modifier = Modifier.size((20f + micLevel * 26f).dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                 }
@@ -644,91 +713,53 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
                 Spacer(modifier = Modifier.height(16.dp))
             }
 
-            Button(
-                onClick = {
-                    val needsTranscribeKey = !isLocalProvider(modelChoice) && apiKeys.keyFor(modelChoice).isEmpty()
-                    val needsLlmKey = llmChoice == "OpenAI" && apiKeys.openai.isEmpty()
-                    if (needsTranscribeKey || needsLlmKey) {
-                        onOpenSettings()
-                        return@Button
-                    }
-
-                    if (!hasPermission) {
-                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                        return@Button
-                    }
-
-                    if (isRecording) {
-                        isRecording = false
-                        statusText = "Stopping recording..."
-                        Log.i("SmartNoteTaker", "Recording stopped. Starting processing pipeline.")
-                        val audioFile = wavRecorder.stop()
-                        
-                        if (audioFile != null) {
-                            coroutineScope.launch {
-                                try {
-                                    Log.i("SmartNoteTaker", "Step 1: Transcribing with $modelChoice (language=$transcribeLanguage)")
-                                    val startTime = System.currentTimeMillis()
-                                    val rawText = aiProcessor.transcribe(
-                                        choice = modelChoice,
-                                        language = transcribeLanguage,
-                                        audioFile = audioFile,
-                                        wavRecorder = wavRecorder,
-                                        modelDownloader = modelDownloader,
-                                        keys = apiKeys,
-                                        usageTracker = usageTracker,
-                                        onStatus = { statusText = "1/2: $it" },
-                                        onProgress = { p -> downloadProgress = p / 100f },
-                                    )
-                                    downloadProgress = 0f
-                                    val computeTimeSec = (System.currentTimeMillis() - startTime) / 1000.0
-                                    val audioDurationSec = (audioFile.length() - 44) / 32000.0
-                                    Log.i("SmartNoteTaker", String.format("Transcription done in %.2fs (audio %.2fs). Result: %s", computeTimeSec, audioDurationSec, rawText))
-
-                                    val cleanText: String
-                                    if (llmChoice == "OpenAI") {
-                                        statusText = "2/2: Cleaning up text (Cloud)..."
-                                        Log.i("SmartNoteTaker", "Step 2: Cleaning up text with OpenAI (Cloud)")
-                                        cleanText = aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker)
-                                    } else {
-                                        statusText = "2/2: Downloading/Loading LLM (Local)..."
-                                        Log.i("SmartNoteTaker", "Step 2: Cleaning up text Local. Requesting LLM: $llmChoice")
-                                        val llmFile = modelDownloader.downloadLlmModel(llmChoice) { p ->
-                                            downloadProgress = p / 100f
-                                            val modelTag = if(llmChoice.contains("E2B")) "E2B" else "E4B"
-                                            statusText = "Downloading LLM ($modelTag): ${p}%"
-                                            if (p % 5 == 0) Log.d("SmartNoteTaker", "Gemma LLM download: $p%")
-                                        }
-                                        downloadProgress = 0f
-                                        if (llmFile == null) {
-                                            Log.e("SmartNoteTaker", "Failed to load local LLM model.")
-                                            throw Exception("Failed to load local LLM")
-                                        }
-                                        statusText = "2/2: Cleaning up text (Local)..."
-                                        Log.i("SmartNoteTaker", "Starting local LLM inference with LiteRT-LM (Gemma)")
-                                        cleanText = aiProcessor.cleanTextLocal(rawText, llmFile)
-                                        Log.i("SmartNoteTaker", "Local LLM inference complete.")
-                                    }
-                                    
-                                    notesText += if (notesText.isEmpty()) cleanText else "\n\n${cleanText}"
-                                    costMicros = usageTracker.totalMicros()
-                                    statusText = "Ready"
-                                    Log.i("SmartNoteTaker", "Pipeline finished successfully.")
-                                } catch (e: Exception) {
-                                    statusText = "Error: ${e.message}"
-                                    Log.e("SmartNoteTaker", "Pipeline failed with error", e)
-                                }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // WRITE: dictate new text (transcribe + cleanup, append to notes).
+                Button(
+                    onClick = {
+                        when {
+                            recordMode == "write" -> stopAndProcess()
+                            recordMode == null -> when {
+                                keysMissing() -> onOpenSettings()
+                                !hasPermission -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                else -> startRecording("write")
                             }
                         }
-                    } else {
-                        isRecording = true
-                        statusText = "Recording..."
-                        wavRecorder.start()
-                    }
-                },
-                modifier = Modifier.fillMaxWidth().height(56.dp)
+                    },
+                    enabled = recordMode != "modify",
+                    modifier = Modifier.weight(1f).height(56.dp)
+                ) {
+                    Text(if (recordMode == "write") "Stop" else "Write")
+                }
+
+                // MODIFY: speak an edit instruction applied to the existing notes.
+                Button(
+                    onClick = {
+                        when {
+                            recordMode == "modify" -> stopAndProcess()
+                            recordMode == null -> when {
+                                keysMissing() -> onOpenSettings()
+                                !hasPermission -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                else -> startRecording("modify")
+                            }
+                        }
+                    },
+                    // Only available when there is real text to modify.
+                    enabled = recordMode != "write" && (recordMode == "modify" || notesText.isNotBlank()),
+                    modifier = Modifier.weight(1f).height(56.dp)
+                ) {
+                    Text(if (recordMode == "modify") "Stop" else "Modify")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = { if (undoStack.isNotEmpty()) notesText = undoStack.removeAt(undoStack.size - 1) },
+                enabled = recordMode == null && undoStack.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(if (isRecording) "Stop Recording" else "Start Recording")
+                Text(if (undoStack.isEmpty()) "Undo" else "Undo (${undoStack.size})")
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -1025,5 +1056,60 @@ class AIProcessor {
             val message = choices.getJSONObject(0).getJSONObject("message")
             message.getString("content")
         }
+    }
+
+    /** Rewrites [existingText] per a spoken [instruction], via OpenAI gpt-4o-mini. */
+    suspend fun modifyText(existingText: String, instruction: String, apiKey: String, usageTracker: UsageTracker): String =
+        openAiChat(
+            system = "You are a precise text editor. Apply the user's instruction to the supplied text and output ONLY the revised text — no commentary, preamble, or surrounding quotes.",
+            user = "TEXT:\n$existingText\n\nINSTRUCTION:\n$instruction",
+            apiKey = apiKey,
+            usageTracker = usageTracker,
+        )
+
+    private suspend fun openAiChat(system: String, user: String, apiKey: String, usageTracker: UsageTracker): String = withContext(Dispatchers.IO) {
+        val jsonBody = JSONObject().apply {
+            put("model", "gpt-4o-mini")
+            val messages = JSONArray()
+            messages.put(JSONObject().apply { put("role", "system"); put("content", system) })
+            messages.put(JSONObject().apply { put("role", "user"); put("content", user) })
+            put("messages", messages)
+        }
+        val request = Request.Builder()
+            .url(LLM_ENDPOINT)
+            .header("Authorization", "Bearer ${apiKey}")
+            .post(jsonBody.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("LLM error: ${response.message}")
+            val responseBody = response.body?.string() ?: throw IOException("Empty response")
+            val jsonObject = JSONObject(responseBody)
+            jsonObject.optJSONObject("usage")?.let { usage ->
+                usageTracker.add(
+                    PROVIDER_OPENAI,
+                    CostEstimator.llmMicros(usage.optInt("prompt_tokens"), usage.optInt("completion_tokens")),
+                )
+            }
+            jsonObject.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+        }
+    }
+
+    /** Local (Gemma) equivalent of [modifyText]. */
+    suspend fun modifyTextLocal(existingText: String, instruction: String, modelFile: File): String = withContext(Dispatchers.IO) {
+        var resultText = ""
+        try {
+            val engine = FallbackEngine.initializeEngine(modelFile)
+            val conversation = engine.createConversation(ConversationConfig())
+            val prompt = "You are a precise text editor. Apply the instruction to the text and output ONLY the revised text, with no commentary.\n\nTEXT:\n$existingText\n\nINSTRUCTION:\n$instruction"
+            val responseMsg = conversation.sendMessage(prompt)
+            val contents = responseMsg.contents.contents
+            resultText = (contents.firstOrNull() as? Content.Text)?.text ?: ""
+            conversation.close()
+            engine.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            throw e
+        }
+        resultText
     }
 }

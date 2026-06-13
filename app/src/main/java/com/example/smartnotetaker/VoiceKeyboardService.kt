@@ -10,7 +10,9 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
+import android.widget.Button
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -30,7 +32,35 @@ class VoiceKeyboardService : InputMethodService() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Main + serviceJob)
 
-    private var isRecording = false
+    // recordMode: null = idle, "write" = dictate & commit, "modify" = spoken edit instruction.
+    private var recordMode: String? = null
+    private val undoStack = ArrayDeque<String>()
+
+    // Live mic-level: scales whichever record button is active while capturing.
+    private val micHandler = Handler(Looper.getMainLooper())
+    private var micLevelView: View? = null
+    private val micLevelRunnable = object : Runnable {
+        override fun run() {
+            val s = 1f + wavRecorder.amplitude * 0.8f
+            micLevelView?.apply { scaleX = s; scaleY = s }
+            micHandler.postDelayed(this, 60)
+        }
+    }
+
+    /** Full text of the target input field, or "" if unavailable. */
+    private fun readFieldText(): String {
+        val ic = currentInputConnection ?: return ""
+        return ic.getExtractedText(ExtractedTextRequest(), 0)?.text?.toString() ?: ""
+    }
+
+    /** Replaces the entire target field content with [text]. */
+    private fun replaceFieldText(text: String) {
+        val ic = currentInputConnection ?: return
+        ic.beginBatchEdit()
+        ic.performContextMenuAction(android.R.id.selectAll)
+        ic.commitText(text, 1)
+        ic.endBatchEdit()
+    }
 
     // Hold-to-repeat backspace, like a standard Android keyboard: starts deleting
     // characters, then switches to whole words once it has been held a while.
@@ -129,89 +159,145 @@ class VoiceKeyboardService : InputMethodService() {
             }
         }
 
-        btnMic.setOnClickListener {
-            // Read settings on-click to ensure we pick up fresh changes from SettingsActivity
+        val btnModify = layout.findViewById<Button>(R.id.btn_modify)
+        val btnUndo = layout.findViewById<Button>(R.id.btn_undo)
+
+        // Resolve primary text color from the theme (for the idle status text).
+        val typedValue = TypedValue()
+        theme.resolveAttribute(android.R.attr.textColorPrimary, typedValue, true)
+        val textColorPrimary = if (typedValue.type >= TypedValue.TYPE_FIRST_COLOR_INT && typedValue.type <= TypedValue.TYPE_LAST_COLOR_INT) {
+            typedValue.data
+        } else {
+            ContextCompat.getColor(this, typedValue.resourceId)
+        }
+
+        fun finishUi() {
+            micHandler.removeCallbacks(micLevelRunnable)
+            micLevelView?.apply { scaleX = 1f; scaleY = 1f }
+            micLevelView = null
+            tvStatus.text = "Touch and speak"
+            tvStatus.setTextColor(textColorPrimary)
+            btnMic.isEnabled = true
+            btnModify.isEnabled = true
+        }
+
+        // False (and toasts) if a required key or mic permission is missing.
+        fun canRecord(modelChoice: String, llmChoice: String, apiKeys: ApiKeys): Boolean {
+            val needsTranscribeKey = !isLocalProvider(modelChoice) && apiKeys.keyFor(modelChoice).isEmpty()
+            val needsLlmKey = llmChoice == "OpenAI" && apiKeys.openai.isEmpty()
+            if (needsTranscribeKey || needsLlmKey) {
+                Toast.makeText(this, "Please open Settings to set your API Key", Toast.LENGTH_LONG).show()
+                return false
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "Please open CheapWhisper app and grant microphone permissions", Toast.LENGTH_LONG).show()
+                return false
+            }
+            return true
+        }
+
+        fun startRec(mode: String, activeButton: View) {
+            recordMode = mode
+            tvStatus.text = if (mode == "write") "Recording... Tap to Stop" else "Listening for edit... Tap to Stop"
+            tvStatus.setTextColor(Color.RED)
+            micLevelView = activeButton
+            wavRecorder.start()
+            micHandler.post(micLevelRunnable)
+        }
+
+        // Stop + run the pipeline. Write => transcribe + cleanup + commit;
+        // Modify => transcribe (edit instruction) + LLM-rewrite the field's text.
+        fun stopAndProcess() {
+            val mode = recordMode ?: return
+            recordMode = null
+            micHandler.removeCallbacks(micLevelRunnable)
+            micLevelView?.apply { scaleX = 1f; scaleY = 1f }
+            micLevelView = null
+            tvStatus.text = "Processing..."
+            tvStatus.setTextColor(Color.GRAY)
+            btnMic.isEnabled = false
+            btnModify.isEnabled = false
+
             val secureStorage = SecureStorage(this)
             val apiKeys = secureStorage.getApiKeys()
             val transcribeLanguage = secureStorage.getTranscribeLanguage()
             val llmChoice = secureStorage.getLlmChoice()
             val modelChoice = secureStorage.getModelChoice()
-            
-            // Resolve primary text color dynamically from the theme
-            val typedValue = TypedValue()
-            theme.resolveAttribute(android.R.attr.textColorPrimary, typedValue, true)
-            val textColorPrimary = if (typedValue.type >= TypedValue.TYPE_FIRST_COLOR_INT && typedValue.type <= TypedValue.TYPE_LAST_COLOR_INT) {
-                typedValue.data
-            } else {
-                ContextCompat.getColor(this, typedValue.resourceId)
-            }
-            
-            val needsTranscribeKey = !isLocalProvider(modelChoice) && apiKeys.keyFor(modelChoice).isEmpty()
-            val needsLlmKey = llmChoice == "OpenAI" && apiKeys.openai.isEmpty()
-            if (needsTranscribeKey || needsLlmKey) {
-                Toast.makeText(this, "Please open Settings to set your API Key", Toast.LENGTH_LONG).show()
-                return@setOnClickListener
-            }
+            val existingText = if (mode == "modify") readFieldText() else ""
 
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "Please open CheapWhisper app and grant microphone permissions", Toast.LENGTH_LONG).show()
-                return@setOnClickListener
-            }
+            val file = wavRecorder.stop()
+            if (file == null) { finishUi(); return }
 
-            if (!isRecording) {
-                isRecording = true
-                tvStatus.text = "Recording... Tap mic to Stop"
-                tvStatus.setTextColor(Color.RED)
-                wavRecorder.start()
-            } else {
-                isRecording = false
-                tvStatus.text = "Processing..."
-                tvStatus.setTextColor(Color.GRAY)
-                btnMic.isEnabled = false
-                
-                val file = wavRecorder.stop()
-                if (file != null) {
-                    serviceScope.launch {
-                        try {
-                            val rawText = aiProcessor.transcribe(
-                                choice = modelChoice,
-                                language = transcribeLanguage,
-                                audioFile = file,
-                                wavRecorder = wavRecorder,
-                                modelDownloader = modelDownloader,
-                                keys = apiKeys,
-                                usageTracker = usageTracker,
-                                onStatus = { tvStatus.text = it },
-                                onProgress = { },
-                            )
+            serviceScope.launch {
+                try {
+                    val rawText = aiProcessor.transcribe(
+                        choice = modelChoice,
+                        language = transcribeLanguage,
+                        audioFile = file,
+                        wavRecorder = wavRecorder,
+                        modelDownloader = modelDownloader,
+                        keys = apiKeys,
+                        usageTracker = usageTracker,
+                        onStatus = { tvStatus.text = it },
+                        onProgress = { },
+                    )
 
-                            val cleanText: String
-                            if (llmChoice == "OpenAI") {
-                                tvStatus.text = "Cleaning up Text (Cloud)..."
-                                cleanText = aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker)
-                            } else {
-                                val llmFile = modelDownloader.downloadLlmModel(llmChoice) { }
-                                if (llmFile == null) throw Exception("Failed to load local LLM")
-                                tvStatus.text = "Cleaning up Text (Local)..."
-                                cleanText = aiProcessor.cleanTextLocal(rawText, llmFile)
-                            }
+                    val llmFile: java.io.File? = if (llmChoice != "OpenAI") {
+                        tvStatus.text = "Loading LLM (Local)..."
+                        modelDownloader.downloadLlmModel(llmChoice) { } ?: throw Exception("Failed to load local LLM")
+                    } else null
 
-                            currentInputConnection?.commitText("${cleanText} ", 1)
-                            refreshCostViews(btnCost, tvCostBreakdown)
-                        } catch (e: Exception) {
-                            Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
-                        } finally {
-                            tvStatus.text = "Touch and speak"
-                            tvStatus.setTextColor(textColorPrimary) 
-                            btnMic.isEnabled = true
-                        }
+                    if (mode == "write") {
+                        tvStatus.text = "Cleaning up Text..."
+                        val cleanText = if (llmChoice == "OpenAI")
+                            aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker)
+                        else aiProcessor.cleanTextLocal(rawText, llmFile!!)
+                        currentInputConnection?.commitText("$cleanText ", 1)
+                    } else {
+                        tvStatus.text = "Applying edit..."
+                        val newText = if (llmChoice == "OpenAI")
+                            aiProcessor.modifyText(existingText, rawText, apiKeys.openai, usageTracker)
+                        else aiProcessor.modifyTextLocal(existingText, rawText, llmFile!!)
+                        undoStack.addLast(existingText)
+                        replaceFieldText(newText.trim())
                     }
-                } else {
-                    tvStatus.text = "Touch and speak"
-                    tvStatus.setTextColor(textColorPrimary)
-                    btnMic.isEnabled = true
+                    refreshCostViews(btnCost, tvCostBreakdown)
+                } catch (e: Exception) {
+                    Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                } finally {
+                    finishUi()
                 }
             }
+        }
+
+        btnMic.setOnClickListener {
+            when {
+                recordMode == "write" -> stopAndProcess()
+                recordMode == null -> {
+                    val ss = SecureStorage(this)
+                    if (canRecord(ss.getModelChoice(), ss.getLlmChoice(), ss.getApiKeys())) startRec("write", btnMic)
+                }
+            }
+        }
+
+        btnModify.setOnClickListener {
+            when {
+                recordMode == "modify" -> stopAndProcess()
+                recordMode == null -> {
+                    if (readFieldText().isBlank()) {
+                        Toast.makeText(this, "No text to modify", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    val ss = SecureStorage(this)
+                    if (canRecord(ss.getModelChoice(), ss.getLlmChoice(), ss.getApiKeys())) startRec("modify", btnModify)
+                }
+            }
+        }
+
+        btnUndo.setOnClickListener {
+            if (recordMode != null) return@setOnClickListener
+            if (undoStack.isNotEmpty()) replaceFieldText(undoStack.removeLast())
+            else Toast.makeText(this, "Nothing to undo", Toast.LENGTH_SHORT).show()
         }
 
         return layout
@@ -221,7 +307,8 @@ class VoiceKeyboardService : InputMethodService() {
         super.onDestroy()
         serviceJob.cancel()
         deleteHandler.removeCallbacks(deleteRunnable)
-        if (isRecording) {
+        micHandler.removeCallbacks(micLevelRunnable)
+        if (recordMode != null) {
             wavRecorder.stop()
         }
     }
