@@ -5,7 +5,7 @@ plugins {
 
 // Single source of truth for the app version — keep in sync with the GitHub release tag (vX.Y.Z).
 // versionCode is derived so it always increases: major*10000 + minor*100 + patch (minor/patch < 100).
-val appVersionName = "0.2.6"
+val appVersionName = "0.2.7"
 val appVersionCode = appVersionName.split(".").map { it.toInt() }
     .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
 

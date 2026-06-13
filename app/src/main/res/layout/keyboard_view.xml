@@ -4,7 +4,9 @@
     android:layout_height="wrap_content"
     android:orientation="vertical"
     android:background="?android:attr/colorBackground"
-    android:padding="8dp">
+    android:padding="8dp"
+    android:clipChildren="false"
+    android:clipToPadding="false">
 
     <!-- Top Row -->
     <RelativeLayout
@@ -38,8 +40,10 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center"
-        android:paddingTop="16dp"
-        android:paddingBottom="16dp">
+        android:clipChildren="false"
+        android:clipToPadding="false"
+        android:paddingTop="32dp"
+        android:paddingBottom="32dp">
 
         <ImageButton
             android:id="@+id/btn_settings"
@@ -55,8 +59,10 @@
 
         <FrameLayout
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content">
-            <!-- Large circular mic button -->
+            android:layout_height="wrap_content"
+            android:clipChildren="false"
+            android:clipToPadding="false">
+            <!-- Large circular mic button (scales with mic level; must not be cropped) -->
             <ImageButton
                 android:id="@+id/btn_mic"
                 android:layout_width="80dp"
@@ -84,8 +90,10 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center"
-        android:paddingTop="4dp"
-        android:paddingBottom="4dp">
+        android:clipChildren="false"
+        android:clipToPadding="false"
+        android:paddingTop="20dp"
+        android:paddingBottom="20dp">
 
         <ImageButton
             android:id="@+id/btn_modify"
