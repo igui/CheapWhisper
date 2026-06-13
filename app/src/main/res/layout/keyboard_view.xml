@@ -78,34 +78,36 @@
             android:src="@drawable/ic_backspace" />
     </LinearLayout>
 
-    <!-- Modify / Undo Row -->
+    <!-- Modify / Undo Row: smaller circular buttons mirroring the mic button -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:gravity="center"
-        android:paddingStart="8dp"
-        android:paddingEnd="8dp">
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
 
-        <Button
+        <ImageButton
             android:id="@+id/btn_modify"
-            style="?android:attr/buttonStyleSmall"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Modify" />
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="@drawable/bg_mic_button"
+            android:src="@drawable/ic_edit"
+            android:padding="12dp"
+            android:contentDescription="Modify text" />
 
         <Space
-            android:layout_width="8dp"
+            android:layout_width="32dp"
             android:layout_height="wrap_content" />
 
-        <Button
+        <ImageButton
             android:id="@+id/btn_undo"
-            style="?android:attr/buttonStyleSmall"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Undo" />
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="@drawable/bg_mic_button"
+            android:src="@drawable/ic_undo"
+            android:padding="12dp"
+            android:contentDescription="Undo" />
     </LinearLayout>
 
     <!-- Bottom Row -->

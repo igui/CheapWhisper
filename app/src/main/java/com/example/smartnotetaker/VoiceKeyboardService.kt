@@ -10,9 +10,9 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
 import android.view.inputmethod.InputConnection
-import android.widget.Button
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -34,7 +34,38 @@ class VoiceKeyboardService : InputMethodService() {
 
     // recordMode: null = idle, "write" = dictate & commit, "modify" = spoken edit instruction.
     private var recordMode: String? = null
+    private var processing = false
+    private var imeJob: Job? = null
     private val undoStack = ArrayDeque<String>()
+
+    // Button refs kept so enabled/disabled state can be refreshed outside onCreateInputView.
+    private var micButton: ImageButton? = null
+    private var modifyButton: ImageButton? = null
+    private var undoButton: ImageButton? = null
+
+    /** Enables/greys Modify (needs field text) and Undo (needs history); disables all while busy. */
+    private fun updateButtonStates() {
+        fun set(b: ImageButton?, enabled: Boolean) {
+            b?.let { it.isEnabled = enabled; it.alpha = if (enabled) 1f else 0.4f }
+        }
+        // The actively-held record button must stay enabled to receive its release event.
+        set(micButton, (recordMode == null && !processing) || recordMode == "write")
+        set(modifyButton, (recordMode == null && !processing && readFieldText().isNotBlank()) || recordMode == "modify")
+        set(undoButton, recordMode == null && !processing && undoStack.isNotEmpty())
+    }
+
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        updateButtonStates()
+    }
+
+    override fun onUpdateSelection(
+        oldSelStart: Int, oldSelEnd: Int, newSelStart: Int, newSelEnd: Int,
+        candidatesStart: Int, candidatesEnd: Int,
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        updateButtonStates()  // re-evaluate Modify as the field's text changes
+    }
 
     // Live mic-level: scales whichever record button is active while capturing.
     private val micHandler = Handler(Looper.getMainLooper())
@@ -163,8 +194,11 @@ class VoiceKeyboardService : InputMethodService() {
             }
         }
 
-        val btnModify = layout.findViewById<Button>(R.id.btn_modify)
-        val btnUndo = layout.findViewById<Button>(R.id.btn_undo)
+        val btnModify = layout.findViewById<ImageButton>(R.id.btn_modify)
+        val btnUndo = layout.findViewById<ImageButton>(R.id.btn_undo)
+        micButton = btnMic
+        modifyButton = btnModify
+        undoButton = btnUndo
 
         // Resolve primary text color from the theme (for the idle status text).
         val typedValue = TypedValue()
@@ -179,10 +213,10 @@ class VoiceKeyboardService : InputMethodService() {
             micHandler.removeCallbacks(micLevelRunnable)
             micLevelView?.apply { scaleX = 1f; scaleY = 1f }
             micLevelView = null
-            tvStatus.text = "Touch and speak"
+            tvStatus.text = "Hold a button to speak"
             tvStatus.setTextColor(textColorPrimary)
-            btnMic.isEnabled = true
-            btnModify.isEnabled = true
+            processing = false
+            updateButtonStates()
         }
 
         // False (and toasts) if a required key or mic permission is missing.
@@ -202,11 +236,12 @@ class VoiceKeyboardService : InputMethodService() {
 
         fun startRec(mode: String, activeButton: View) {
             recordMode = mode
-            tvStatus.text = if (mode == "write") "Recording... Tap to Stop" else "Listening for edit... Tap to Stop"
+            tvStatus.text = if (mode == "write") "Recording... release to stop" else "Listening for edit... release to stop"
             tvStatus.setTextColor(Color.RED)
             micLevelView = activeButton
             wavRecorder.start()
             micHandler.post(micLevelRunnable)
+            updateButtonStates()  // lock out the other buttons while recording
         }
 
         // Stop + run the pipeline. Write => transcribe + cleanup + commit;
@@ -218,9 +253,10 @@ class VoiceKeyboardService : InputMethodService() {
             micLevelView?.apply { scaleX = 1f; scaleY = 1f }
             micLevelView = null
             tvStatus.text = "Processing..."
+            tvStatus.text = "Processing... (tap to cancel)"
             tvStatus.setTextColor(Color.GRAY)
-            btnMic.isEnabled = false
-            btnModify.isEnabled = false
+            processing = true
+            updateButtonStates()
 
             val secureStorage = SecureStorage(this)
             val apiKeys = secureStorage.getApiKeys()
@@ -232,7 +268,7 @@ class VoiceKeyboardService : InputMethodService() {
             val file = wavRecorder.stop()
             if (file == null) { finishUi(); return }
 
-            serviceScope.launch {
+            imeJob = serviceScope.launch {
                 try {
                     val rawText = aiProcessor.transcribe(
                         choice = modelChoice,
@@ -266,49 +302,63 @@ class VoiceKeyboardService : InputMethodService() {
                         replaceFieldText(newText.trim())
                     }
                     refreshCostViews(btnCost, tvCostBreakdown)
+                } catch (e: CancellationException) {
+                    throw e  // user cancelled; cancelActive() resets the UI
                 } catch (e: Exception) {
-                    Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    if (isActive) Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
                 } finally {
+                    imeJob = null
                     finishUi()
                 }
             }
         }
 
-        btnMic.setOnClickListener {
-            when {
-                recordMode == "write" -> stopAndProcess()
-                recordMode == null -> {
-                    val ss = SecureStorage(this)
-                    if (canRecord(ss.getModelChoice(), ss.getLlmChoice(), ss.getApiKeys())) startRec("write", btnMic)
+        // Push-to-talk: hold to record, release to stop + process. Returns a touch handler
+        // bound to [mode]; the button only fires when enabled (disabled => no recording).
+        fun recordTouch(mode: String): View.OnTouchListener = View.OnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (recordMode == null && !processing) {
+                        val ss = SecureStorage(this)
+                        if (canRecord(ss.getModelChoice(), ss.getLlmChoice(), ss.getApiKeys())) startRec(mode, v)
+                    }
+                    true
                 }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                    if (recordMode == mode) stopAndProcess()
+                    true
+                }
+                else -> false
             }
         }
 
-        btnModify.setOnClickListener {
-            when {
-                recordMode == "modify" -> stopAndProcess()
-                recordMode == null -> {
-                    if (readFieldText().isBlank()) {
-                        Toast.makeText(this, "No text to modify", Toast.LENGTH_SHORT).show()
-                        return@setOnClickListener
-                    }
-                    val ss = SecureStorage(this)
-                    if (canRecord(ss.getModelChoice(), ss.getLlmChoice(), ss.getApiKeys())) startRec("modify", btnModify)
-                }
-            }
-        }
+        btnMic.setOnTouchListener(recordTouch("write"))
+        btnModify.setOnTouchListener(recordTouch("modify"))
 
         btnUndo.setOnClickListener {
-            if (recordMode != null) return@setOnClickListener
+            if (recordMode != null || processing) return@setOnClickListener
             if (undoStack.isNotEmpty()) replaceFieldText(undoStack.removeLast())
-            else Toast.makeText(this, "Nothing to undo", Toast.LENGTH_SHORT).show()
+            updateButtonStates()
         }
 
+        // Tap the status line while a request is running to cancel it.
+        tvStatus.setOnClickListener {
+            if (processing) {
+                imeJob?.cancel()
+                aiProcessor.cancelInFlight()
+                Toast.makeText(this, "Cancelled", Toast.LENGTH_SHORT).show()
+                // finishUi() runs via the cancelled job's finally block.
+            }
+        }
+
+        updateButtonStates()
         return layout
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        imeJob?.cancel()
         serviceJob.cancel()
         deleteHandler.removeCallbacks(deleteRunnable)
         micHandler.removeCallbacks(micLevelRunnable)

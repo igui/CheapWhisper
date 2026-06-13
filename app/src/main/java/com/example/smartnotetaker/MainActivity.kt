@@ -32,8 +32,11 @@ import androidx.core.content.ContextCompat
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.whispercpp.whisper.WhisperContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.*
@@ -603,6 +606,7 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
     var downloadProgress by remember { mutableStateOf(0f) }
     var micLevel by remember { mutableStateOf(0f) }
     val undoStack = remember { mutableStateListOf<String>() }
+    var processingJob by remember { mutableStateOf<Job?>(null) }
 
     val wavRecorder = remember { WavRecorder(context) }
     val aiProcessor = remember { AIProcessor() }
@@ -647,7 +651,7 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
         recordMode = null
         statusText = "Processing…"
         val audioFile = wavRecorder.stop() ?: run { statusText = "Ready"; return }
-        coroutineScope.launch {
+        processingJob = coroutineScope.launch {
             try {
                 val rawText = aiProcessor.transcribe(
                     choice = modelChoice,
@@ -687,13 +691,32 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
                 }
                 costMicros = usageTracker.totalMicros()
                 statusText = "Ready"
+            } catch (e: CancellationException) {
+                throw e  // cancelled by the user; cancelActive() has reset the UI
             } catch (e: Exception) {
-                statusText = "Error: ${e.message}"
-                Log.e("SmartNoteTaker", "Pipeline failed", e)
+                if (isActive) {
+                    statusText = "Error: ${e.message}"
+                    Log.e("SmartNoteTaker", "Pipeline failed", e)
+                }
+            } finally {
+                downloadProgress = 0f
+                processingJob = null
             }
         }
     }
 
+    // Cancel an in-progress recording (discard) or a running transcription/LLM request.
+    fun cancelActive() {
+        if (recordMode != null) {
+            wavRecorder.stop()
+            recordMode = null
+        }
+        processingJob?.cancel()
+        processingJob = null
+        aiProcessor.cancelInFlight()
+        downloadProgress = 0f
+        statusText = "Cancelled"
+    }
 
     Scaffold(
         topBar = {
@@ -781,7 +804,7 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
                             }
                         }
                     },
-                    enabled = recordMode != "modify",
+                    enabled = recordMode != "modify" && processingJob == null,
                     modifier = Modifier.weight(1f).height(56.dp)
                 ) {
                     Text(if (recordMode == "write") "Stop" else "Write")
@@ -800,7 +823,7 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
                         }
                     },
                     // Only available when there is real text to modify.
-                    enabled = recordMode != "write" && (recordMode == "modify" || notesText.isNotBlank()),
+                    enabled = recordMode != "write" && processingJob == null && (recordMode == "modify" || notesText.isNotBlank()),
                     modifier = Modifier.weight(1f).height(56.dp)
                 ) {
                     Text(if (recordMode == "modify") "Stop" else "Modify")
@@ -809,12 +832,23 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            OutlinedButton(
-                onClick = { if (undoStack.isNotEmpty()) notesText = undoStack.removeAt(undoStack.size - 1) },
-                enabled = recordMode == null && undoStack.isNotEmpty(),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (undoStack.isEmpty()) "Undo" else "Undo (${undoStack.size})")
+            // Cancel: abort an in-progress recording or request.
+            if (recordMode != null || processingJob != null) {
+                Button(
+                    onClick = { cancelActive() },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Cancel")
+                }
+            } else {
+                OutlinedButton(
+                    onClick = { if (undoStack.isNotEmpty()) notesText = undoStack.removeAt(undoStack.size - 1) },
+                    enabled = undoStack.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (undoStack.isEmpty()) "Undo" else "Undo (${undoStack.size})")
+                }
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -831,6 +865,11 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
 
 class AIProcessor {
     private val client = OkHttpClient()
+
+    /** Aborts any in-flight HTTP calls — used to cancel a running transcription/LLM request. */
+    fun cancelInFlight() {
+        client.dispatcher.cancelAll()
+    }
 
     /** A transcript plus the provider-reported billed audio duration (seconds), if any. */
     private data class Stt(val text: String, val seconds: Double?)
