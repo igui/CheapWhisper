@@ -1,0 +1,1029 @@
+package com.example.smartnotetaker
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.Image
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.whispercpp.whisper.WhisperContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.IOException
+
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.ConversationConfig
+
+// --- CONFIGURATION ---
+const val WHISPER_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
+const val LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+const val GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
+const val DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
+const val ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/speech-to-text"
+const val ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
+
+// --- TRANSCRIPTION PROVIDERS (values persisted as model_choice) ---
+const val PROVIDER_OPENAI = "OpenAI"
+const val PROVIDER_DEEPGRAM = "Deepgram"
+const val PROVIDER_GROQ = "Groq"
+const val PROVIDER_ELEVENLABS = "ElevenLabs"
+const val PROVIDER_ASSEMBLYAI = "AssemblyAI"
+const val PROVIDER_LOCAL_TINY = "Local (tiny)"
+const val PROVIDER_LOCAL_BASE = "Local (base)"
+const val PROVIDER_LOCAL_SMALL = "Local (small)"
+
+val TRANSCRIPTION_PROVIDERS = listOf(
+    PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI,
+    PROVIDER_LOCAL_TINY, PROVIDER_LOCAL_BASE, PROVIDER_LOCAL_SMALL,
+)
+
+fun isLocalProvider(choice: String): Boolean = choice.startsWith("Local")
+
+/** Language options for the Settings dropdown: display label -> code ("auto" = auto-detect). */
+val TRANSCRIBE_LANGUAGES = listOf(
+    "Auto-detect" to "auto",
+    "English" to "en",
+    "Spanish" to "es",
+    "French" to "fr",
+    "German" to "de",
+    "Italian" to "it",
+    "Portuguese" to "pt",
+    "Dutch" to "nl",
+    "Russian" to "ru",
+    "Chinese" to "zh",
+    "Japanese" to "ja",
+    "Korean" to "ko",
+    "Hindi" to "hi",
+    "Arabic" to "ar",
+)
+
+/** Holds every transcription provider's API key. Local providers need none. */
+data class ApiKeys(
+    val openai: String,
+    val deepgram: String,
+    val groq: String,
+    val elevenLabs: String,
+    val assemblyAi: String,
+) {
+    /** The key required for [choice], or "" for local providers (no key needed). */
+    fun keyFor(choice: String): String = when (choice) {
+        PROVIDER_OPENAI -> openai
+        PROVIDER_DEEPGRAM -> deepgram
+        PROVIDER_GROQ -> groq
+        PROVIDER_ELEVENLABS -> elevenLabs
+        PROVIDER_ASSEMBLYAI -> assemblyAi
+        else -> ""
+    }
+}
+
+// --- THIRD-PARTY COST TRACKING ---
+// Paid third-party providers whose usage we meter. Local Whisper / Gemma run
+// on-device and cost nothing, so they are intentionally excluded.
+val COST_PROVIDERS = listOf(
+    PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI,
+)
+
+/** Estimates USD cost (returned as integer micro-dollars to avoid float drift). */
+object CostEstimator {
+    fun transcriptionMicros(provider: String, audioDurationSec: Double): Long {
+        // Published pay-as-you-go rates, USD per minute of audio (June 2026).
+        val usdPerMin = when (provider) {
+            PROVIDER_OPENAI -> 0.006
+            PROVIDER_GROQ -> 0.04 / 60.0          // $0.04/hr
+            PROVIDER_DEEPGRAM -> 0.0077
+            PROVIDER_ELEVENLABS -> 0.40 / 60.0    // $0.40/hr
+            PROVIDER_ASSEMBLYAI -> 0.27 / 60.0    // $0.27/hr
+            else -> 0.0
+        }
+        return Math.round(usdPerMin * (audioDurationSec / 60.0) * 1_000_000)
+    }
+
+    /** OpenAI gpt-4o-mini text cleanup, priced from returned token usage. */
+    fun llmMicros(promptTokens: Int, completionTokens: Int): Long {
+        val usd = promptTokens * (0.15 / 1_000_000) + completionTokens * (0.60 / 1_000_000)
+        return Math.round(usd * 1_000_000)
+    }
+}
+
+/** Persists cumulative spend per provider (micro-USD) in plain prefs. */
+class UsageTracker(context: Context) {
+    private val prefs = context.getSharedPreferences("usage_prefs", Context.MODE_PRIVATE)
+
+    fun add(provider: String, micros: Long) {
+        if (micros <= 0L) return
+        prefs.edit().putLong(provider, getMicros(provider) + micros).apply()
+    }
+
+    fun getMicros(provider: String): Long = prefs.getLong(provider, 0L)
+
+    /** Per-provider spend in display order. */
+    fun byProvider(): List<Pair<String, Long>> = COST_PROVIDERS.map { it to getMicros(it) }
+
+    fun totalMicros(): Long = COST_PROVIDERS.sumOf { getMicros(it) }
+
+    fun reset() = prefs.edit().clear().apply()
+
+    companion object {
+        fun formatUsd(micros: Long): String = "$" + String.format("%.4f", micros / 1_000_000.0)
+    }
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    AppNavigation()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AppNavigation() {
+    var currentScreen by remember { mutableStateOf("main") }
+    
+    if (currentScreen == "settings") {
+        SettingsScreen(onBack = { currentScreen = "main" })
+    } else {
+        NoteTakerScreen(onOpenSettings = { currentScreen = "settings" })
+    }
+}
+
+class SecureStorage(context: Context) {
+    private val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+
+    private val sharedPreferences = EncryptedSharedPreferences.create(
+        context,
+        "secret_shared_prefs",
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    // --- Per-provider API keys ---
+    fun saveOpenAiApiKey(key: String) {
+        sharedPreferences.edit().putString("openai_api_key", key).apply()
+    }
+
+    fun getOpenAiApiKey(): String {
+        // Backward-compat: fall back to the legacy single "api_key" if the
+        // provider-specific key hasn't been set yet.
+        val key = sharedPreferences.getString("openai_api_key", "") ?: ""
+        if (key.isNotEmpty()) return key
+        return sharedPreferences.getString("api_key", "") ?: ""
+    }
+
+    fun saveDeepgramApiKey(key: String) {
+        sharedPreferences.edit().putString("deepgram_api_key", key).apply()
+    }
+
+    fun getDeepgramApiKey(): String {
+        return sharedPreferences.getString("deepgram_api_key", "") ?: ""
+    }
+
+    fun saveGroqApiKey(key: String) {
+        sharedPreferences.edit().putString("groq_api_key", key).apply()
+    }
+
+    fun getGroqApiKey(): String {
+        return sharedPreferences.getString("groq_api_key", "") ?: ""
+    }
+
+    fun saveElevenLabsApiKey(key: String) {
+        sharedPreferences.edit().putString("elevenlabs_api_key", key).apply()
+    }
+
+    fun getElevenLabsApiKey(): String {
+        return sharedPreferences.getString("elevenlabs_api_key", "") ?: ""
+    }
+
+    fun saveAssemblyAiApiKey(key: String) {
+        sharedPreferences.edit().putString("assemblyai_api_key", key).apply()
+    }
+
+    fun getAssemblyAiApiKey(): String {
+        return sharedPreferences.getString("assemblyai_api_key", "") ?: ""
+    }
+
+    /** Convenience holder of every transcription key, for AIProcessor.transcribe(). */
+    fun getApiKeys(): ApiKeys = ApiKeys(
+        openai = getOpenAiApiKey(),
+        deepgram = getDeepgramApiKey(),
+        groq = getGroqApiKey(),
+        elevenLabs = getElevenLabsApiKey(),
+        assemblyAi = getAssemblyAiApiKey(),
+    )
+
+    fun saveModelChoice(choice: String) {
+        sharedPreferences.edit().putString("model_choice", choice).apply()
+    }
+
+    fun getModelChoice(): String {
+        return sharedPreferences.getString("model_choice", "OpenAI") ?: "OpenAI"
+    }
+
+    fun saveLlmChoice(choice: String) {
+        sharedPreferences.edit().putString("llm_choice", choice).apply()
+    }
+
+    fun getLlmChoice(): String {
+        return sharedPreferences.getString("llm_choice", "OpenAI") ?: "OpenAI"
+    }
+
+    fun saveTranscribeLanguage(code: String) {
+        sharedPreferences.edit().putString("transcribe_language", code).apply()
+    }
+
+    /** ISO-639-1 language code, or "auto" for auto-detection (default). */
+    fun getTranscribeLanguage(): String {
+        return sharedPreferences.getString("transcribe_language", "auto") ?: "auto"
+    }
+}
+
+@Composable
+private fun CostBreakdownDialog(tracker: UsageTracker, onDismiss: () -> Unit) {
+    val rows = tracker.byProvider()
+    val total = rows.sumOf { it.second }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Usage cost by provider") },
+        text = {
+            Column {
+                rows.forEach { (provider, micros) ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(provider)
+                        Text(UsageTracker.formatUsd(micros))
+                    }
+                }
+                Divider(modifier = Modifier.padding(vertical = 8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Total", style = MaterialTheme.typography.titleMedium)
+                    Text(UsageTracker.formatUsd(total), style = MaterialTheme.typography.titleMedium)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+@Composable
+private fun ApiKeyField(label: String, value: String, onValueChange: (String) -> Unit) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        singleLine = true,
+        visualTransformation = PasswordVisualTransformation(),
+        modifier = Modifier.fillMaxWidth()
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val secureStorage = remember { SecureStorage(context) }
+    
+    var openAiKey by remember { mutableStateOf(secureStorage.getOpenAiApiKey()) }
+    var deepgramKey by remember { mutableStateOf(secureStorage.getDeepgramApiKey()) }
+    var groqKey by remember { mutableStateOf(secureStorage.getGroqApiKey()) }
+    var elevenLabsKey by remember { mutableStateOf(secureStorage.getElevenLabsApiKey()) }
+    var assemblyAiKey by remember { mutableStateOf(secureStorage.getAssemblyAiApiKey()) }
+    var transcribeLanguage by remember { mutableStateOf(secureStorage.getTranscribeLanguage()) }
+    var modelChoice by remember { mutableStateOf(secureStorage.getModelChoice()) }
+    var llmChoice by remember { mutableStateOf(secureStorage.getLlmChoice()) }
+    var langExpanded by remember { mutableStateOf(false) }
+
+    val usageTracker = remember { UsageTracker(context) }
+    var costMicros by remember { mutableStateOf(usageTracker.totalMicros()) }
+
+    var downloadedModelsSize by remember { mutableStateOf(0L) }
+    var downloadedModelsCount by remember { mutableStateOf(0) }
+    
+    fun refreshModelStats() {
+        var size = 0L
+        var count = 0
+        context.filesDir.listFiles()?.forEach { file ->
+            if (file.name.endsWith(".bin") || file.name.endsWith(".litertlm")) {
+                size += file.length()
+                count++
+            }
+        }
+        downloadedModelsSize = size
+        downloadedModelsCount = count
+    }
+    
+    LaunchedEffect(Unit) {
+        refreshModelStats()
+    }
+    
+    fun formatSize(size: Long): String {
+        if (size <= 0) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        val digitGroups = (Math.log10(size.toDouble()) / Math.log10(1024.0)).toInt()
+        return String.format("%.1f %s", size / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Settings") },
+                navigationIcon = {
+                    IconButton(onClick = {
+                        secureStorage.saveOpenAiApiKey(openAiKey)
+                        secureStorage.saveDeepgramApiKey(deepgramKey)
+                        secureStorage.saveGroqApiKey(groqKey)
+                        secureStorage.saveElevenLabsApiKey(elevenLabsKey)
+                        secureStorage.saveAssemblyAiApiKey(assemblyAiKey)
+                        secureStorage.saveTranscribeLanguage(transcribeLanguage)
+                        secureStorage.saveModelChoice(modelChoice)
+                        secureStorage.saveLlmChoice(llmChoice)
+                        Log.i("SmartNoteTaker", "Settings Saved. Transcription: $modelChoice ($transcribeLanguage), LLM: $llmChoice")
+                        onBack()
+                    }) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { paddingValues ->
+        Column(
+            modifier = Modifier.fillMaxSize().padding(paddingValues).padding(16.dp).verticalScroll(rememberScrollState())
+        ) {
+            Text("Transcription Model", style = MaterialTheme.typography.titleMedium)
+            TRANSCRIPTION_PROVIDERS.forEach { choice ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(selected = modelChoice == choice, onClick = { modelChoice = choice })
+                    Text(choice)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Transcription Language", style = MaterialTheme.typography.titleMedium)
+            val selectedLangLabel = TRANSCRIBE_LANGUAGES.firstOrNull { it.second == transcribeLanguage }?.first ?: "Auto-detect"
+            ExposedDropdownMenuBox(
+                expanded = langExpanded,
+                onExpandedChange = { langExpanded = !langExpanded }
+            ) {
+                OutlinedTextField(
+                    value = selectedLangLabel,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Language") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = langExpanded) },
+                    modifier = Modifier.fillMaxWidth().menuAnchor()
+                )
+                ExposedDropdownMenu(
+                    expanded = langExpanded,
+                    onDismissRequest = { langExpanded = false }
+                ) {
+                    TRANSCRIBE_LANGUAGES.forEach { (label, code) ->
+                        DropdownMenuItem(
+                            text = { Text(label) },
+                            onClick = {
+                                transcribeLanguage = code
+                                langExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("LLM Cleanup Model", style = MaterialTheme.typography.titleMedium)
+            listOf("OpenAI", "Local (Gemma-4 E2B)", "Local (Gemma-4 E4B)").forEach { choice ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(selected = llmChoice == choice, onClick = { llmChoice = choice })
+                    Text(choice)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // API key fields: show the one for the selected cloud transcription provider,
+            // plus the OpenAI key whenever cloud cleanup (OpenAI) is selected.
+            val showOpenAiKey = modelChoice == PROVIDER_OPENAI || llmChoice == "OpenAI"
+            if (showOpenAiKey) {
+                ApiKeyField("OpenAI API Key", openAiKey) { openAiKey = it }
+            }
+            if (modelChoice == PROVIDER_DEEPGRAM) {
+                ApiKeyField("Deepgram API Key", deepgramKey) { deepgramKey = it }
+            }
+            if (modelChoice == PROVIDER_GROQ) {
+                ApiKeyField("Groq API Key", groqKey) { groqKey = it }
+            }
+            if (modelChoice == PROVIDER_ELEVENLABS) {
+                ApiKeyField("ElevenLabs API Key", elevenLabsKey) { elevenLabsKey = it }
+            }
+            if (modelChoice == PROVIDER_ASSEMBLYAI) {
+                ApiKeyField("AssemblyAI API Key", assemblyAiKey) { assemblyAiKey = it }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+            
+            Divider()
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Text("Storage", style = MaterialTheme.typography.titleMedium)
+            Text("Downloaded Models: $downloadedModelsCount", style = MaterialTheme.typography.bodyMedium)
+            Text("Total Size: ${formatSize(downloadedModelsSize)}", style = MaterialTheme.typography.bodyMedium)
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Button(
+                onClick = {
+                    val files = context.filesDir.listFiles()
+                    var deletedCount = 0
+                    files?.forEach { file ->
+                        if (file.name.endsWith(".bin") || file.name.endsWith(".litertlm")) {
+                            if (file.delete()) deletedCount++
+                        }
+                    }
+                    val deletedSizeFormat = formatSize(downloadedModelsSize)
+                    refreshModelStats()
+                    android.widget.Toast.makeText(context, "Cleared $deletedCount files ($deletedSizeFormat)", android.widget.Toast.LENGTH_SHORT).show()
+                },
+                enabled = downloadedModelsCount > 0,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, disabledContainerColor = Color.LightGray),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Clear Downloaded Models")
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Divider()
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Usage Cost (third parties)", style = MaterialTheme.typography.titleMedium)
+            usageTracker.byProvider().forEach { (provider, micros) ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(provider, style = MaterialTheme.typography.bodyMedium)
+                    Text(UsageTracker.formatUsd(micros), style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Total", style = MaterialTheme.typography.titleMedium)
+                Text(UsageTracker.formatUsd(costMicros), style = MaterialTheme.typography.titleMedium)
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(
+                onClick = {
+                    usageTracker.reset()
+                    costMicros = 0L
+                    android.widget.Toast.makeText(context, "Usage cost reset", android.widget.Toast.LENGTH_SHORT).show()
+                },
+                enabled = costMicros > 0L,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, disabledContainerColor = Color.LightGray),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Reset Usage Cost")
+            }
+        }
+    }
+}
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun NoteTakerScreen(onOpenSettings: () -> Unit) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val secureStorage = remember { SecureStorage(context) }
+
+    val apiKeys = remember { secureStorage.getApiKeys() }
+    val transcribeLanguage = remember { secureStorage.getTranscribeLanguage() }
+    var modelChoice by remember { mutableStateOf(secureStorage.getModelChoice()) }
+    var llmChoice by remember { mutableStateOf(secureStorage.getLlmChoice()) }
+
+    var isRecording by remember { mutableStateOf(false) }
+    var statusText by remember { mutableStateOf("Ready") }
+    var notesText by remember { mutableStateOf("") }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    
+    val wavRecorder = remember { WavRecorder(context) }
+    val aiProcessor = remember { AIProcessor() }
+    val modelDownloader = remember { LocalModelDownloader(context) }
+    val usageTracker = remember { UsageTracker(context) }
+
+    var costMicros by remember { mutableStateOf(usageTracker.totalMicros()) }
+    var showCostBreakdown by remember { mutableStateOf(false) }
+
+    var hasPermission by remember { 
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) 
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+        hasPermission = isGranted
+    }
+
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { 
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(id = R.drawable.logo),
+                            contentDescription = "CheapWhisper Logo",
+                            modifier = Modifier.size(32.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("CheapWhisper")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
+                }
+            )
+        },
+        floatingActionButton = {
+            // Bottom-right: total third-party spend; tap to expand a per-provider breakdown.
+            ExtendedFloatingActionButton(
+                onClick = { showCostBreakdown = true },
+                icon = { Icon(Icons.Filled.Info, contentDescription = "Usage cost") },
+                text = { Text(UsageTracker.formatUsd(costMicros)) },
+            )
+        }
+    ) { paddingValues ->
+        if (showCostBreakdown) {
+            CostBreakdownDialog(
+                tracker = usageTracker,
+                onDismiss = { showCostBreakdown = false },
+            )
+        }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.height(48.dp)
+            ) {
+                if (isRecording) {
+                    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+                    val alpha by infiniteTransition.animateFloat(
+                        initialValue = 0.3f,
+                        targetValue = 1f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(800, easing = FastOutSlowInEasing),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "alpha"
+                    )
+                    Icon(
+                        imageVector = Icons.Filled.Mic, 
+                        contentDescription = "Recording", 
+                        tint = Color.Red.copy(alpha = alpha),
+                        modifier = Modifier.size(32.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                Text(text = statusText, color = MaterialTheme.colorScheme.primary)
+            }
+            
+            Text("Transcribing with: ${modelChoice}", style = MaterialTheme.typography.bodySmall)
+            Text("LLM Cleanup: ${llmChoice}", style = MaterialTheme.typography.bodySmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            
+            if (downloadProgress > 0f && downloadProgress < 1f) {
+                LinearProgressIndicator(
+                    progress = downloadProgress,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                )
+            } else {
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+
+            Button(
+                onClick = {
+                    val needsTranscribeKey = !isLocalProvider(modelChoice) && apiKeys.keyFor(modelChoice).isEmpty()
+                    val needsLlmKey = llmChoice == "OpenAI" && apiKeys.openai.isEmpty()
+                    if (needsTranscribeKey || needsLlmKey) {
+                        onOpenSettings()
+                        return@Button
+                    }
+
+                    if (!hasPermission) {
+                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        return@Button
+                    }
+
+                    if (isRecording) {
+                        isRecording = false
+                        statusText = "Stopping recording..."
+                        Log.i("SmartNoteTaker", "Recording stopped. Starting processing pipeline.")
+                        val audioFile = wavRecorder.stop()
+                        
+                        if (audioFile != null) {
+                            coroutineScope.launch {
+                                try {
+                                    Log.i("SmartNoteTaker", "Step 1: Transcribing with $modelChoice (language=$transcribeLanguage)")
+                                    val startTime = System.currentTimeMillis()
+                                    val rawText = aiProcessor.transcribe(
+                                        choice = modelChoice,
+                                        language = transcribeLanguage,
+                                        audioFile = audioFile,
+                                        wavRecorder = wavRecorder,
+                                        modelDownloader = modelDownloader,
+                                        keys = apiKeys,
+                                        usageTracker = usageTracker,
+                                        onStatus = { statusText = "1/2: $it" },
+                                        onProgress = { p -> downloadProgress = p / 100f },
+                                    )
+                                    downloadProgress = 0f
+                                    val computeTimeSec = (System.currentTimeMillis() - startTime) / 1000.0
+                                    val audioDurationSec = (audioFile.length() - 44) / 32000.0
+                                    Log.i("SmartNoteTaker", String.format("Transcription done in %.2fs (audio %.2fs). Result: %s", computeTimeSec, audioDurationSec, rawText))
+
+                                    val cleanText: String
+                                    if (llmChoice == "OpenAI") {
+                                        statusText = "2/2: Cleaning up text (Cloud)..."
+                                        Log.i("SmartNoteTaker", "Step 2: Cleaning up text with OpenAI (Cloud)")
+                                        cleanText = aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker)
+                                    } else {
+                                        statusText = "2/2: Downloading/Loading LLM (Local)..."
+                                        Log.i("SmartNoteTaker", "Step 2: Cleaning up text Local. Requesting LLM: $llmChoice")
+                                        val llmFile = modelDownloader.downloadLlmModel(llmChoice) { p ->
+                                            downloadProgress = p / 100f
+                                            val modelTag = if(llmChoice.contains("E2B")) "E2B" else "E4B"
+                                            statusText = "Downloading LLM ($modelTag): ${p}%"
+                                            if (p % 5 == 0) Log.d("SmartNoteTaker", "Gemma LLM download: $p%")
+                                        }
+                                        downloadProgress = 0f
+                                        if (llmFile == null) {
+                                            Log.e("SmartNoteTaker", "Failed to load local LLM model.")
+                                            throw Exception("Failed to load local LLM")
+                                        }
+                                        statusText = "2/2: Cleaning up text (Local)..."
+                                        Log.i("SmartNoteTaker", "Starting local LLM inference with LiteRT-LM (Gemma)")
+                                        cleanText = aiProcessor.cleanTextLocal(rawText, llmFile)
+                                        Log.i("SmartNoteTaker", "Local LLM inference complete.")
+                                    }
+                                    
+                                    notesText += if (notesText.isEmpty()) cleanText else "\n\n${cleanText}"
+                                    costMicros = usageTracker.totalMicros()
+                                    statusText = "Ready"
+                                    Log.i("SmartNoteTaker", "Pipeline finished successfully.")
+                                } catch (e: Exception) {
+                                    statusText = "Error: ${e.message}"
+                                    Log.e("SmartNoteTaker", "Pipeline failed with error", e)
+                                }
+                            }
+                        }
+                    } else {
+                        isRecording = true
+                        statusText = "Recording..."
+                        wavRecorder.start()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) {
+                Text(if (isRecording) "Stop Recording" else "Start Recording")
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            OutlinedTextField(
+                value = notesText,
+                onValueChange = { notesText = it },
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                label = { Text("Your Notes") }
+            )
+        }
+    }
+}
+
+class AIProcessor {
+    private val client = OkHttpClient()
+
+    /** A transcript plus the provider-reported billed audio duration (seconds), if any. */
+    private data class Stt(val text: String, val seconds: Double?)
+
+    /**
+     * Single entry point for transcription. Dispatches to the provider named by [choice]
+     * (one of the PROVIDER_* constants), passing [language] ("auto" or an ISO-639-1 code).
+     * [onStatus] surfaces user-facing progress; [onProgress] reports local model download %.
+     */
+    suspend fun transcribe(
+        choice: String,
+        language: String,
+        audioFile: File,
+        wavRecorder: WavRecorder,
+        modelDownloader: LocalModelDownloader,
+        keys: ApiKeys,
+        usageTracker: UsageTracker,
+        onStatus: (String) -> Unit,
+        onProgress: (Int) -> Unit,
+    ): String {
+        val result: Stt = when (choice) {
+            PROVIDER_OPENAI -> {
+                onStatus("Transcribing (OpenAI)…")
+                transcribeOpenAiCompatible(WHISPER_ENDPOINT, "whisper-1", keys.openai, audioFile, language)
+            }
+            PROVIDER_GROQ -> {
+                onStatus("Transcribing (Groq)…")
+                transcribeOpenAiCompatible(GROQ_ENDPOINT, "whisper-large-v3-turbo", keys.groq, audioFile, language)
+            }
+            PROVIDER_DEEPGRAM -> {
+                onStatus("Transcribing (Deepgram)…")
+                transcribeDeepgram(audioFile, keys.deepgram, language)
+            }
+            PROVIDER_ELEVENLABS -> {
+                onStatus("Transcribing (ElevenLabs)…")
+                transcribeElevenLabs(audioFile, keys.elevenLabs, language)
+            }
+            PROVIDER_ASSEMBLYAI -> {
+                transcribeAssemblyAi(audioFile, keys.assemblyAi, language, onStatus)
+            }
+            else -> {
+                // Local whisper.cpp (tiny / base / small)
+                val modelName = when (choice) {
+                    PROVIDER_LOCAL_TINY -> "tiny"
+                    PROVIDER_LOCAL_SMALL -> "small"
+                    else -> "base"
+                }
+                onStatus("Loading model ($modelName)…")
+                val modelFile = modelDownloader.downloadModel(modelName, onProgress)
+                    ?: throw IOException("Failed to load local Whisper model")
+                onStatus("Transcribing (Local)…")
+                Stt(transcribeAudioLocal(audioFile, modelFile, wavRecorder, language), null)
+            }
+        }
+        // Meter paid providers (local is free). Prefer the duration the provider reports
+        // (what they actually bill on); fall back to the WAV's own length.
+        if (!isLocalProvider(choice)) {
+            val seconds = result.seconds ?: ((audioFile.length() - 44).coerceAtLeast(0) / 32000.0)
+            usageTracker.add(choice, CostEstimator.transcriptionMicros(choice, seconds))
+        }
+        return result.text
+    }
+
+    /** OpenAI Whisper API and the Groq drop-in clone share this multipart shape. */
+    private suspend fun transcribeOpenAiCompatible(
+        endpoint: String, model: String, apiKey: String, audioFile: File, language: String,
+    ): Stt = withContext(Dispatchers.IO) {
+        val builder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", audioFile.name, audioFile.asRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("model", model)
+            // verbose_json adds a top-level "duration" (audio seconds) for accurate metering.
+            .addFormDataPart("response_format", "verbose_json")
+        if (language != "auto") builder.addFormDataPart("language", language)
+
+        val request = Request.Builder()
+            .url(endpoint)
+            .header("Authorization", "Bearer ${apiKey}")
+            .post(builder.build())
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("Transcription error: ${response.code} ${response.message}")
+            val responseBody = response.body?.string() ?: throw IOException("Empty response")
+            val json = JSONObject(responseBody)
+            Stt(json.getString("text"), json.optDouble("duration").takeUnless { it.isNaN() })
+        }
+    }
+
+    /** Deepgram Nova-3 prerecorded REST API: raw audio body, "Token" auth. */
+    private suspend fun transcribeDeepgram(
+        audioFile: File, apiKey: String, language: String,
+    ): Stt = withContext(Dispatchers.IO) {
+        // Nova-3 uses language=multi for multilingual auto-detection.
+        val lang = if (language == "auto") "multi" else language
+        val url = "$DEEPGRAM_ENDPOINT?model=nova-3&smart_format=true&language=$lang"
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Token ${apiKey}")
+            .post(audioFile.asRequestBody("audio/wav".toMediaType()))
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("Deepgram error: ${response.code} ${response.message}")
+            val responseBody = response.body?.string() ?: throw IOException("Empty response")
+            val json = JSONObject(responseBody)
+            val transcript = json
+                .getJSONObject("results")
+                .getJSONArray("channels").getJSONObject(0)
+                .getJSONArray("alternatives").getJSONObject(0)
+                .getString("transcript")
+            // metadata.duration is the billed audio length.
+            val seconds = json.optJSONObject("metadata")?.optDouble("duration")?.takeUnless { it.isNaN() }
+            Stt(transcript, seconds)
+        }
+    }
+
+    /** ElevenLabs Scribe v1: multipart, "xi-api-key" header. */
+    private suspend fun transcribeElevenLabs(
+        audioFile: File, apiKey: String, language: String,
+    ): Stt = withContext(Dispatchers.IO) {
+        val builder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", audioFile.name, audioFile.asRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("model_id", "scribe_v1")
+        if (language != "auto") builder.addFormDataPart("language_code", language)
+
+        val request = Request.Builder()
+            .url(ELEVENLABS_ENDPOINT)
+            .header("xi-api-key", apiKey)
+            .post(builder.build())
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("ElevenLabs error: ${response.code} ${response.message}")
+            val responseBody = response.body?.string() ?: throw IOException("Empty response")
+            val json = JSONObject(responseBody)
+            // No duration field; approximate from the last word's end timestamp (null -> file fallback).
+            val words = json.optJSONArray("words")
+            val seconds = if (words != null && words.length() > 0) {
+                words.getJSONObject(words.length() - 1).optDouble("end").takeUnless { it.isNaN() }
+            } else null
+            Stt(json.getString("text"), seconds)
+        }
+    }
+
+    /** AssemblyAI: async upload -> create transcript -> poll until complete. */
+    private suspend fun transcribeAssemblyAi(
+        audioFile: File, apiKey: String, language: String, onStatus: (String) -> Unit,
+    ): Stt = withContext(Dispatchers.IO) {
+        // 1) Upload the audio bytes.
+        onStatus("Uploading audio (AssemblyAI)…")
+        val uploadRequest = Request.Builder()
+            .url("$ASSEMBLYAI_BASE/upload")
+            .header("authorization", apiKey)
+            .post(audioFile.asRequestBody("application/octet-stream".toMediaType()))
+            .build()
+        val uploadUrl = client.newCall(uploadRequest).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("AssemblyAI upload error: ${response.code} ${response.message}")
+            val body = response.body?.string() ?: throw IOException("Empty response")
+            JSONObject(body).getString("upload_url")
+        }
+
+        // 2) Request a transcript. Auto-detect language unless a code was forced.
+        val createJson = JSONObject().apply {
+            put("audio_url", uploadUrl)
+            if (language == "auto") put("language_detection", true) else put("language_code", language)
+        }
+        val createRequest = Request.Builder()
+            .url("$ASSEMBLYAI_BASE/transcript")
+            .header("authorization", apiKey)
+            .post(createJson.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        val transcriptId = client.newCall(createRequest).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("AssemblyAI create error: ${response.code} ${response.message}")
+            val body = response.body?.string() ?: throw IOException("Empty response")
+            JSONObject(body).getString("id")
+        }
+
+        // 3) Poll until completed or errored (cap ~120s).
+        onStatus("Transcribing (AssemblyAI)…")
+        val pollUrl = "$ASSEMBLYAI_BASE/transcript/$transcriptId"
+        repeat(80) {
+            val pollRequest = Request.Builder()
+                .url(pollUrl)
+                .header("authorization", apiKey)
+                .get()
+                .build()
+            val json = client.newCall(pollRequest).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("AssemblyAI poll error: ${response.code} ${response.message}")
+                JSONObject(response.body?.string() ?: throw IOException("Empty response"))
+            }
+            when (json.getString("status")) {
+                "completed" -> return@withContext Stt(
+                    json.getString("text"),
+                    json.optDouble("audio_duration").takeUnless { it.isNaN() },
+                )
+                "error" -> throw IOException("AssemblyAI failed: ${json.optString("error")}")
+            }
+            delay(1500)
+        }
+        throw IOException("AssemblyAI timed out")
+    }
+
+    suspend fun transcribeAudioLocal(audioFile: File, modelFile: File, wavRecorder: WavRecorder, language: String): String = withContext(Dispatchers.IO) {
+        val floatArray = wavRecorder.decodeWavToFloatArray(audioFile)
+
+        val whisperContext = com.whispercpp.whisper.WhisperContext.createContextFromFile(modelFile.absolutePath)
+        val result = whisperContext.transcribeData(floatArray, language = language, printTimestamp = false)
+        whisperContext.release()
+
+        result.trim()
+    }
+
+    suspend fun cleanTextLocal(rawText: String, modelFile: File): String = withContext(Dispatchers.IO) {
+        if (rawText.isBlank()) return@withContext ""
+        
+        var resultText = ""
+        
+        try {
+            val engine = FallbackEngine.initializeEngine(modelFile)
+            
+            val conversation = engine.createConversation(ConversationConfig())
+            val prompt = "You are an assistant that cleans up dictated voice notes. Fix punctuation, grammar, and formatting. Remove filler words (ums, ahs). Do not add new information or conversational filler. Output ONLY the cleaned text.\n\nHere is the raw text to clean:\n${rawText}"
+            
+            val responseMsg = conversation.sendMessage(prompt)
+            val contents = responseMsg.contents.contents
+            resultText = (contents.firstOrNull() as? Content.Text)?.text ?: ""
+            
+            conversation.close()
+            engine.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            throw e
+        }
+        
+        resultText
+    }
+
+    suspend fun cleanText(rawText: String, apiKey: String, usageTracker: UsageTracker): String = withContext(Dispatchers.IO) {
+        if (rawText.isBlank()) return@withContext ""
+        val jsonBody = JSONObject().apply {
+            put("model", "gpt-4o-mini")
+            
+            val messages = JSONArray()
+            messages.put(JSONObject().apply {
+                put("role", "system")
+                put("content", "You are an assistant that cleans up dictated voice notes. Fix punctuation, grammar, and formatting. Remove filler words (ums, ahs). Do not add new information or conversational filler. Output ONLY the cleaned text.")
+            })
+            messages.put(JSONObject().apply {
+                put("role", "user")
+                put("content", rawText)
+            })
+            
+            put("messages", messages)
+        }
+
+        val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaType())
+
+        val request = Request.Builder()
+            .url(LLM_ENDPOINT)
+            .header("Authorization", "Bearer ${apiKey}")
+            .post(requestBody)
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("LLM error: ${response.message}")
+            val responseBody = response.body?.string() ?: throw IOException("Empty response")
+            val jsonObject = JSONObject(responseBody)
+            jsonObject.optJSONObject("usage")?.let { usage ->
+                usageTracker.add(
+                    PROVIDER_OPENAI,
+                    CostEstimator.llmMicros(usage.optInt("prompt_tokens"), usage.optInt("completion_tokens")),
+                )
+            }
+            val choices = jsonObject.getJSONArray("choices")
+            val message = choices.getJSONObject(0).getJSONObject("message")
+            message.getString("content")
+        }
+    }
+}

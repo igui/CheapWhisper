@@ -1,0 +1,26 @@
+# Build outputs
+build/
+app/build/
+.gradle/
+.cxx/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+
+# Local config & SDK (machine-specific)
+local.properties
+/android-sdk/
+
+# Vendored toolchains / downloads (do not commit)
+/gradle-8.5/
+/*.zip
+
+# Profiling / crash dumps
+*.hprof
+
+# Scratch / misc
+/test.kt
+.claude/
+.DS_Store
