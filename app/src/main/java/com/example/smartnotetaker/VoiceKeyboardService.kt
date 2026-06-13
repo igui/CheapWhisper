@@ -106,7 +106,7 @@ class VoiceKeyboardService : InputMethodService() {
         val rows = usageTracker.byProvider().filter { it.second > 0L }  // omit no-usage providers
         val lines = if (rows.isEmpty()) "No usage yet."
         else rows.joinToString("\n") { (provider, micros) ->
-            "$provider (${CostEstimator.formatPerMin(provider)}): ${UsageTracker.formatUsd(micros)}"
+            "$provider (${CostEstimator.formatPerHour(provider)}): ${UsageTracker.formatUsd(micros)}"
         }
         breakdown.text = "$lines\n—\nTotal: ${UsageTracker.formatUsd(total)}"
     }

@@ -148,20 +148,20 @@ object CostEstimator {
         else -> 0.0
     }
 
-    /** Cleanup-model picker label: FREE on-device, else the per-minute LLM estimate. */
+    /** Cleanup-model picker label: FREE on-device, else the per-hour LLM estimate. */
     fun llmRateLabel(llmChoice: String): String =
-        if (llmChoice == "OpenAI") "est. $" + String.format("%.4f", llmUsdPerMinute()) + "/min" else "FREE"
+        if (llmChoice == "OpenAI") "est. $" + String.format("%.2f", llmUsdPerMinute() * 60) + "/hr" else "FREE"
 
-    /** Human-readable per-minute estimate, e.g. "$0.0077/min" (or "free" on-device). */
-    fun formatPerMin(provider: String): String {
-        val rate = usdPerMinute(provider)
-        return if (rate <= 0.0) "free" else "$" + String.format("%.4f", rate) + "/min"
+    /** Human-readable per-hour estimate, e.g. "$0.46/hr" (or "free" on-device). */
+    fun formatPerHour(provider: String): String {
+        val ratePerHour = usdPerMinute(provider) * 60
+        return if (ratePerHour <= 0.0) "free" else "$" + String.format("%.2f", ratePerHour) + "/hr"
     }
 
-    /** Picker label: "FREE" for on-device, otherwise "est. $X/min". */
+    /** Picker label: "FREE" for on-device, otherwise "est. $X/hr". */
     fun rateLabel(provider: String): String {
-        val rate = usdPerMinute(provider)
-        return if (rate <= 0.0) "FREE" else "est. $" + String.format("%.4f", rate) + "/min"
+        val ratePerHour = usdPerMinute(provider) * 60
+        return if (ratePerHour <= 0.0) "FREE" else "est. $" + String.format("%.2f", ratePerHour) + "/hr"
     }
 
     fun transcriptionMicros(provider: String, audioDurationSec: Double): Long =
@@ -331,7 +331,7 @@ private fun CostBreakdownDialog(tracker: UsageTracker, onDismiss: () -> Unit) {
                 }
                 rows.forEach { (provider, micros) ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("$provider  (${CostEstimator.formatPerMin(provider)})")
+                        Text("$provider  (${CostEstimator.formatPerHour(provider)})")
                         Text(UsageTracker.formatUsd(micros))
                     }
                 }
@@ -558,7 +558,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             }
             usageRows.forEach { (provider, micros) ->
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("$provider  (${CostEstimator.formatPerMin(provider)})", style = MaterialTheme.typography.bodyMedium)
+                    Text("$provider  (${CostEstimator.formatPerHour(provider)})", style = MaterialTheme.typography.bodyMedium)
                     Text(UsageTracker.formatUsd(micros), style = MaterialTheme.typography.bodyMedium)
                 }
             }
