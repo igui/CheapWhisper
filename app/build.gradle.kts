@@ -3,6 +3,12 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Single source of truth for the app version — keep in sync with the GitHub release tag (vX.Y.Z).
+// versionCode is derived so it always increases: major*10000 + minor*100 + patch (minor/patch < 100).
+val appVersionName = "0.2.2"
+val appVersionCode = appVersionName.split(".").map { it.toInt() }
+    .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
+
 android {
     namespace = "com.example.smartnotetaker"
     compileSdk = 34
@@ -12,8 +18,8 @@ android {
         applicationId = "com.example.smartnotetaker"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         vectorDrawables {
             useSupportLibrary = true
