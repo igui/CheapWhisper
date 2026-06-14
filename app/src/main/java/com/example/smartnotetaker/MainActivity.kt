@@ -55,6 +55,10 @@ import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.ConversationConfig
 
 // --- CONFIGURATION ---
+// Minimum audio bytes to bother processing (1s @ 16kHz mono 16-bit = 32000 B/s);
+// guards against accidental short taps. WAV PCM payload = file length - 44 header.
+const val MIN_RECORDING_BYTES = 32000
+
 const val WHISPER_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 const val LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 const val GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -651,6 +655,10 @@ fun NoteTakerScreen(onOpenSettings: () -> Unit) {
         recordMode = null
         statusText = "Processing…"
         val audioFile = wavRecorder.stop() ?: run { statusText = "Ready"; return }
+        if (audioFile.length() - 44 < MIN_RECORDING_BYTES) {
+            statusText = "Recording too short — hold longer"
+            return
+        }
         processingJob = coroutineScope.launch {
             try {
                 val rawText = aiProcessor.transcribe(

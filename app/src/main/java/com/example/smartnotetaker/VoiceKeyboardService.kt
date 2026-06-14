@@ -267,6 +267,11 @@ class VoiceKeyboardService : InputMethodService() {
 
             val file = wavRecorder.stop()
             if (file == null) { finishUi(); return }
+            if (file.length() - 44 < MIN_RECORDING_BYTES) {
+                Toast.makeText(this, "Recording too short", Toast.LENGTH_SHORT).show()
+                finishUi()
+                return
+            }
 
             imeJob = serviceScope.launch {
                 try {
