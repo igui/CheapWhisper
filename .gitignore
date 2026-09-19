@@ -24,3 +24,7 @@ local.properties
 /test.kt
 .claude/
 .DS_Store
+
+# Live-test API keys (see .env.example)
+.env
+*.swp

@@ -29,10 +29,40 @@
             android:layout_height="wrap_content"
             android:layout_centerInParent="true"
             android:text="Touch and speak"
+            android:maxLines="1"
+            android:ellipsize="start"
             android:textSize="16sp"
             android:textColor="?android:attr/textColorPrimary"
             android:textStyle="bold" />
+
+        <!-- Cancels the in-flight transcription / cleanup; only visible while processing -->
+        <ImageButton
+            android:id="@+id/btn_cancel"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:background="@drawable/bg_cancel_button"
+            android:src="@drawable/ic_close"
+            android:padding="8dp"
+            android:visibility="gone"
+            android:contentDescription="Cancel" />
     </RelativeLayout>
+
+    <!-- Edit mode: the spoken instruction (live, then final) so the user can check it -->
+    <TextView
+        android:id="@+id/tv_transcript"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:layout_marginEnd="8dp"
+        android:background="@drawable/bg_transcript_box"
+        android:padding="10dp"
+        android:maxLines="4"
+        android:scrollbars="vertical"
+        android:textSize="14sp"
+        android:textColor="?android:attr/textColorPrimary"
+        android:visibility="gone" />
 
     <!-- Middle Row -->
     <LinearLayout
@@ -139,10 +169,19 @@
             android:textSize="14sp"
             android:textColor="?android:attr/textColorSecondary" />
 
-        <Space
+        <!-- Current transcription model, language and cleanup model (from Settings) -->
+        <TextView
+            android:id="@+id/tv_config"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_weight="1" />
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:layout_marginEnd="4dp"
+            android:gravity="end"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:textSize="11sp"
+            android:textColor="?android:attr/textColorSecondary" />
 
         <!-- Bottom-right: total third-party spend; tap to expand the breakdown below. -->
         <TextView

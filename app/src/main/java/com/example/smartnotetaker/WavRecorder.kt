@@ -14,6 +14,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class WavRecorder(private val context: Context) {
+    companion object {
+        /** Peak amplitude (0..1) above which a buffer counts as speech for pause detection. */
+        const val SPEECH_THRESHOLD = 0.05f
+    }
+
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var audioFile: File? = null
@@ -23,6 +28,23 @@ class WavRecorder(private val context: Context) {
     var amplitude: Float = 0f
         private set
 
+    /** PCM bytes written so far in the current recording (excludes the 44-byte header). */
+    @Volatile
+    var pcmBytesWritten: Long = 0L
+        private set
+
+    /** PCM byte offset just past the most recent buffer whose peak exceeded [SPEECH_THRESHOLD]. */
+    @Volatile
+    var lastSpeechByte: Long = 0L
+        private set
+
+    /**
+     * Optional tap on the live audio: called on the recorder thread with each PCM buffer as it
+     * is captured (the buffer is reused, so copy it). Used to feed a streaming transcriber.
+     */
+    @Volatile
+    var onPcm: ((ByteArray, Int) -> Unit)? = null
+
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -31,6 +53,8 @@ class WavRecorder(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun start() {
         audioFile = File(context.cacheDir, "note_audio.wav")
+        pcmBytesWritten = 0L
+        lastSpeechByte = 0L
         audioRecord = AudioRecord(
             MediaRecorder.AudioSource.MIC,
             sampleRate,
@@ -79,14 +103,46 @@ class WavRecorder(private val context: Context) {
                     i += 2
                 }
                 amplitude = (peak / 32768f).coerceIn(0f, 1f)
+                // Publish after the (unbuffered) write so readers never see bytes not yet on disk.
+                pcmBytesWritten += read
+                if (amplitude > SPEECH_THRESHOLD) lastSpeechByte = pcmBytesWritten
+                onPcm?.invoke(data, read)
             }
         }
         amplitude = 0f
         os.close()
     }
 
+    /**
+     * Copies the PCM range [fromByte, toByte) of the in-progress recording into [dest] as a
+     * standalone WAV. Safe to call while recording: only bytes below [pcmBytesWritten] are read.
+     */
+    fun exportChunk(fromByte: Long, toByte: Long, dest: File): File {
+        val src = audioFile ?: throw IllegalStateException("Not recording")
+        val end = toByte.coerceAtMost(pcmBytesWritten)
+        val len = (end - fromByte).coerceAtLeast(0L)
+        val pcm = ByteArray(len.toInt())
+        RandomAccessFile(src, "r").use { raf ->
+            raf.seek(44 + fromByte)
+            raf.readFully(pcm)
+        }
+        FileOutputStream(dest).use { os ->
+            os.write(buildWavHeader(len))
+            os.write(pcm)
+        }
+        return dest
+    }
+
     private fun updateWavHeader(file: File) {
-        val totalAudioLen = file.length() - 44
+        val header = buildWavHeader(file.length() - 44)
+        val randomAccessFile = RandomAccessFile(file, "rw")
+        randomAccessFile.seek(0)
+        randomAccessFile.write(header)
+        randomAccessFile.close()
+    }
+
+    /** 44-byte RIFF/WAVE header for 16 kHz mono 16-bit PCM of [totalAudioLen] bytes. */
+    internal fun buildWavHeader(totalAudioLen: Long): ByteArray {
         val totalDataLen = totalAudioLen + 36
         val byteRate = (sampleRate * 1 * 16 / 8).toLong()
 
@@ -135,11 +191,7 @@ class WavRecorder(private val context: Context) {
         header[41] = (totalAudioLen shr 8 and 0xff).toByte()
         header[42] = (totalAudioLen shr 16 and 0xff).toByte()
         header[43] = (totalAudioLen shr 24 and 0xff).toByte()
-
-        val randomAccessFile = RandomAccessFile(file, "rw")
-        randomAccessFile.seek(0)
-        randomAccessFile.write(header)
-        randomAccessFile.close()
+        return header
     }
 
     suspend fun decodeWavToFloatArray(file: File): FloatArray = withContext(Dispatchers.IO) {

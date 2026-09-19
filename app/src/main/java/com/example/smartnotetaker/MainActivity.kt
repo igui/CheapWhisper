@@ -9,23 +9,17 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.foundation.Image
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -34,11 +28,10 @@ import androidx.security.crypto.MasterKey
 import com.whispercpp.whisper.WhisperContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
@@ -61,6 +54,10 @@ const val MIN_RECORDING_BYTES = 32000
 
 const val WHISPER_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 const val LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+// GPT-5.6 Luna: the cost-tier model of OpenAI's current GPT-5.6 family. Cleanup is a short
+// rewrite, so reasoning effort is pinned low; sampling params (temperature etc.) are rejected.
+const val OPENAI_LLM_MODEL = "gpt-5.6-luna"
+const val OPENAI_REASONING_EFFORT = "low"
 const val GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 const val DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
 const val ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -72,6 +69,7 @@ const val PROVIDER_DEEPGRAM = "Deepgram"
 const val PROVIDER_GROQ = "Groq"
 const val PROVIDER_ELEVENLABS = "ElevenLabs"
 const val PROVIDER_ASSEMBLYAI = "AssemblyAI"
+const val PROVIDER_SONIOX = "Soniox"
 const val PROVIDER_LOCAL_TINY = "Local (tiny)"
 const val PROVIDER_LOCAL_BASE = "Local (base)"
 const val PROVIDER_LOCAL_SMALL = "Local (small)"
@@ -80,8 +78,13 @@ const val PROVIDER_LOCAL_SMALL = "Local (small)"
 // same-vendor transcription spend (so OpenAI transcription vs. cleanup are distinct lines).
 const val PROVIDER_LLM = "OpenAI (cleanup LLM)"
 
+/** System instruction given to the cleanup LLM; users can override it in Settings. */
+const val DEFAULT_CLEANUP_PROMPT =
+    "You are an assistant that cleans up dictated voice notes. Fix punctuation, grammar, and formatting. Remove filler words (ums, ahs). Do not add new information or conversational filler. Output ONLY the cleaned text."
+
+// Groq is deliberately not offered: its STT API has no streaming, so no live text.
 val TRANSCRIPTION_PROVIDERS = listOf(
-    PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI,
+    PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI, PROVIDER_SONIOX,
     PROVIDER_LOCAL_TINY, PROVIDER_LOCAL_BASE, PROVIDER_LOCAL_SMALL,
 )
 
@@ -112,6 +115,7 @@ data class ApiKeys(
     val groq: String,
     val elevenLabs: String,
     val assemblyAi: String,
+    val soniox: String = "",
 ) {
     /** The key required for [choice], or "" for local providers (no key needed). */
     fun keyFor(choice: String): String = when (choice) {
@@ -120,6 +124,7 @@ data class ApiKeys(
         PROVIDER_GROQ -> groq
         PROVIDER_ELEVENLABS -> elevenLabs
         PROVIDER_ASSEMBLYAI -> assemblyAi
+        PROVIDER_SONIOX -> soniox
         else -> ""
     }
 }
@@ -128,21 +133,21 @@ data class ApiKeys(
 // Paid third-party providers whose usage we meter. Local Whisper / Gemma run
 // on-device and cost nothing, so they are intentionally excluded.
 val COST_PROVIDERS = listOf(
-    PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI,
+    PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI, PROVIDER_SONIOX,
     PROVIDER_LLM,
 )
 
 /** Estimates USD cost (returned as integer micro-dollars to avoid float drift). */
 object CostEstimator {
-    // gpt-4o-mini token pricing (USD per token).
-    private const val GPT4O_MINI_IN = 0.15 / 1_000_000
-    private const val GPT4O_MINI_OUT = 0.60 / 1_000_000
+    // gpt-5.6-luna token pricing (USD per token): $0.20 / 1M input, $1.20 / 1M output.
+    private const val OPENAI_LLM_IN = 0.20 / 1_000_000
+    private const val OPENAI_LLM_OUT = 1.20 / 1_000_000
     // ~160 words/min of speech ≈ ~500 tokens/min in; cleanup output is of similar length.
     private const val LLM_TOKENS_PER_MIN = 500
 
-    /** Estimated cleanup-LLM (gpt-4o-mini) cost per minute of speech. */
+    /** Estimated cleanup-LLM (gpt-5.6-luna) cost per minute of speech. */
     fun llmUsdPerMinute(): Double =
-        LLM_TOKENS_PER_MIN * GPT4O_MINI_IN + LLM_TOKENS_PER_MIN * GPT4O_MINI_OUT
+        LLM_TOKENS_PER_MIN * OPENAI_LLM_IN + LLM_TOKENS_PER_MIN * OPENAI_LLM_OUT
 
     /** Published pay-as-you-go transcription rate, USD per minute (0 for on-device). */
     fun usdPerMinute(provider: String): Double = when (provider) {
@@ -151,6 +156,7 @@ object CostEstimator {
         PROVIDER_DEEPGRAM -> 0.0077
         PROVIDER_ELEVENLABS -> 0.40 / 60.0    // $0.40/hr
         PROVIDER_ASSEMBLYAI -> 0.27 / 60.0    // $0.27/hr
+        PROVIDER_SONIOX -> 0.10 / 60.0        // stt-async-v5 $0.10/hr
         PROVIDER_LLM -> llmUsdPerMinute()
         else -> 0.0
     }
@@ -174,14 +180,41 @@ object CostEstimator {
     fun transcriptionMicros(provider: String, audioDurationSec: Double): Long =
         Math.round(usdPerMinute(provider) * (audioDurationSec / 60.0) * 1_000_000)
 
-    /** Exact OpenAI gpt-4o-mini cost from returned token usage. */
+    /** Streaming (WebSocket) rate where it differs from the one-shot rate, USD per minute. */
+    fun streamingUsdPerMinute(provider: String): Double = when (provider) {
+        PROVIDER_OPENAI -> 0.003                 // gpt-4o-mini-transcribe realtime
+        PROVIDER_ASSEMBLYAI -> 0.15 / 60.0       // Universal-Streaming $0.15/hr
+        PROVIDER_SONIOX -> 0.12 / 60.0           // stt-rt-v5 $0.12/hr
+        PROVIDER_ELEVENLABS -> 0.39 / 60.0       // Scribe v2 realtime $0.39/hr
+        else -> usdPerMinute(provider)           // Deepgram Nova-3 streaming = 0.0077
+    }
+
+    fun streamingMicros(provider: String, audioDurationSec: Double): Long =
+        Math.round(streamingUsdPerMinute(provider) * (audioDurationSec / 60.0) * 1_000_000)
+
+    /** Exact OpenAI cleanup-LLM cost from returned token usage. */
     fun llmMicros(promptTokens: Int, completionTokens: Int): Long =
-        Math.round((promptTokens * GPT4O_MINI_IN + completionTokens * GPT4O_MINI_OUT) * 1_000_000)
+        Math.round((promptTokens * OPENAI_LLM_IN + completionTokens * OPENAI_LLM_OUT) * 1_000_000)
 }
 
 /** Persists cumulative spend per provider (micro-USD) in plain prefs. */
 class UsageTracker(context: Context) {
-    private val prefs = context.getSharedPreferences("usage_prefs", Context.MODE_PRIVATE)
+    // Device-protected (unencrypted) storage: readable before the first unlock after a
+    // reboot, which the direct-boot-aware IME needs. Totals are not secret.
+    private val prefs = context.createDeviceProtectedStorageContext()
+        .getSharedPreferences("usage_prefs", Context.MODE_PRIVATE)
+
+    init {
+        // One-time migration of totals recorded under the old credential-encrypted prefs.
+        val unlocked = context.getSystemService(android.os.UserManager::class.java)?.isUserUnlocked == true
+        if (unlocked && !prefs.getBoolean(MIGRATED_KEY, false)) {
+            val old = context.getSharedPreferences("usage_prefs", Context.MODE_PRIVATE)
+            val editor = prefs.edit()
+            old.all.forEach { (k, v) -> if (v is Long) editor.putLong(k, prefs.getLong(k, 0L) + v) }
+            editor.putBoolean(MIGRATED_KEY, true).apply()
+            old.edit().clear().apply()
+        }
+    }
 
     fun add(provider: String, micros: Long) {
         if (micros <= 0L) return
@@ -195,9 +228,11 @@ class UsageTracker(context: Context) {
 
     fun totalMicros(): Long = COST_PROVIDERS.sumOf { getMicros(it) }
 
-    fun reset() = prefs.edit().clear().apply()
+    fun reset() = prefs.edit().clear().putBoolean(MIGRATED_KEY, true).apply()
 
     companion object {
+        private const val MIGRATED_KEY = "_migrated_from_ce"
+
         // Rounded to cents. Non-zero amounts under a cent show as "< $0.01".
         fun formatUsd(micros: Long): String = when {
             micros <= 0L -> "$0.00"
@@ -208,26 +243,22 @@ class UsageTracker(context: Context) {
 }
 
 class MainActivity : ComponentActivity() {
+    // The IME runs in this app's process, so the mic permission must be granted to the app
+    // itself; ask for it as soon as the app is opened.
+    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    AppNavigation()
+                    SettingsScreen(onBack = { finish() })
                 }
             }
         }
-    }
-}
-
-@Composable
-fun AppNavigation() {
-    var currentScreen by remember { mutableStateOf("main") }
-    
-    if (currentScreen == "settings") {
-        SettingsScreen(onBack = { currentScreen = "main" })
-    } else {
-        NoteTakerScreen(onOpenSettings = { currentScreen = "settings" })
     }
 }
 
@@ -289,6 +320,14 @@ class SecureStorage(context: Context) {
         return sharedPreferences.getString("assemblyai_api_key", "") ?: ""
     }
 
+    fun saveSonioxApiKey(key: String) {
+        sharedPreferences.edit().putString("soniox_api_key", key).apply()
+    }
+
+    fun getSonioxApiKey(): String {
+        return sharedPreferences.getString("soniox_api_key", "") ?: ""
+    }
+
     /** Convenience holder of every transcription key, for AIProcessor.transcribe(). */
     fun getApiKeys(): ApiKeys = ApiKeys(
         openai = getOpenAiApiKey(),
@@ -296,6 +335,7 @@ class SecureStorage(context: Context) {
         groq = getGroqApiKey(),
         elevenLabs = getElevenLabsApiKey(),
         assemblyAi = getAssemblyAiApiKey(),
+        soniox = getSonioxApiKey(),
     )
 
     fun saveModelChoice(choice: String) {
@@ -303,7 +343,9 @@ class SecureStorage(context: Context) {
     }
 
     fun getModelChoice(): String {
-        return sharedPreferences.getString("model_choice", "OpenAI") ?: "OpenAI"
+        val stored = sharedPreferences.getString("model_choice", "OpenAI") ?: "OpenAI"
+        // A previously selected provider that is no longer offered falls back to the default.
+        return if (stored in TRANSCRIPTION_PROVIDERS) stored else "OpenAI"
     }
 
     fun saveLlmChoice(choice: String) {
@@ -322,39 +364,26 @@ class SecureStorage(context: Context) {
     fun getTranscribeLanguage(): String {
         return sharedPreferences.getString("transcribe_language", "auto") ?: "auto"
     }
+
+    fun saveCleanupPrompt(prompt: String) {
+        sharedPreferences.edit().putString("cleanup_prompt", prompt).apply()
+    }
+
+    /** The cleanup LLM's system prompt; a blank saved value falls back to [DEFAULT_CLEANUP_PROMPT]. */
+    fun getCleanupPrompt(): String {
+        val saved = sharedPreferences.getString("cleanup_prompt", "") ?: ""
+        return if (saved.isBlank()) DEFAULT_CLEANUP_PROMPT else saved
+    }
+
 }
 
 @Composable
-private fun CostBreakdownDialog(tracker: UsageTracker, onDismiss: () -> Unit) {
-    val total = tracker.totalMicros()
-    val rows = tracker.byProvider().filter { it.second > 0L }  // omit providers with no usage
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Usage cost by provider") },
-        text = {
-            Column {
-                if (rows.isEmpty()) {
-                    Text("No usage yet.", style = MaterialTheme.typography.bodyMedium)
-                }
-                rows.forEach { (provider, micros) ->
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("$provider  (${CostEstimator.formatPerHour(provider)})")
-                        Text(UsageTracker.formatUsd(micros))
-                    }
-                }
-                Divider(modifier = Modifier.padding(vertical = 8.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Total", style = MaterialTheme.typography.titleMedium)
-                    Text(UsageTracker.formatUsd(total), style = MaterialTheme.typography.titleMedium)
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
-}
-
-@Composable
-private fun ApiKeyField(label: String, value: String, onValueChange: (String) -> Unit) {
+private fun ApiKeyField(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    status: @Composable ColumnScope.() -> Unit = {},
+) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
@@ -363,7 +392,75 @@ private fun ApiKeyField(label: String, value: String, onValueChange: (String) ->
         visualTransformation = PasswordVisualTransformation(),
         modifier = Modifier.fillMaxWidth()
     )
+    Column(modifier = Modifier.padding(start = 4.dp, top = 2.dp)) { status() }
     Spacer(modifier = Modifier.height(8.dp))
+}
+
+/** Result of checking one API key against its provider, for the inline indicator. */
+private sealed class KeyCheck {
+    object Idle : KeyCheck()
+    object Checking : KeyCheck()
+    object Valid : KeyCheck()
+    data class Invalid(val reason: String) : KeyCheck()
+    data class Unreachable(val reason: String) : KeyCheck()
+}
+
+/**
+ * Validates a key only when it changes: the key loaded from storage is taken as already
+ * checked, and every later edit (typing or paste) is debounced ~700 ms and then checked
+ * once. Retyping the last-checked value does not re-check; a blank value shows nothing.
+ * Switching [provider] (e.g. the OpenAI key being checked for the cleanup model instead)
+ * counts as a change.
+ */
+@Composable
+private fun rememberKeyCheck(provider: String, key: String, initialKey: String): KeyCheck {
+    var state by remember { mutableStateOf<KeyCheck>(KeyCheck.Idle) }
+    val lastChecked = remember { mutableStateOf(provider to initialKey) }
+    LaunchedEffect(provider, key) {
+        if (key.isBlank()) { state = KeyCheck.Idle; return@LaunchedEffect }
+        if (lastChecked.value == (provider to key)) return@LaunchedEffect  // unchanged: keep result
+        state = KeyCheck.Checking
+        delay(700)
+        val result = try {
+            when (val r = withContext(Dispatchers.IO) { ApiKeyValidator.validate(provider, key) }) {
+                is ApiKeyValidator.Outcome.Valid -> KeyCheck.Valid
+                is ApiKeyValidator.Outcome.Invalid -> KeyCheck.Invalid(r.reason)
+                is ApiKeyValidator.Outcome.Unreachable -> KeyCheck.Unreachable(r.reason)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KeyCheck.Unreachable(e.message ?: e.javaClass.simpleName)
+        }
+        lastChecked.value = provider to key
+        state = result
+    }
+    return state
+}
+
+/** One status line for a key check. [what] names the thing checked, e.g. "Key" or "Cleanup model". */
+@Composable
+private fun KeyCheckLine(what: String, providerName: String, check: KeyCheck, validNote: String = "") {
+    when (check) {
+        KeyCheck.Idle -> Unit
+        KeyCheck.Checking -> Row(verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp)
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Checking $what…", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        }
+        KeyCheck.Valid -> Text("✓ $what works$validNote", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
+        is KeyCheck.Invalid -> Text("✗ $what: ${check.reason}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+        is KeyCheck.Unreachable -> Text("Could not reach $providerName: ${check.reason}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    }
+}
+
+/** Section label on the left, selector button on the right, on one line. */
+@Composable
+private fun SettingRow(label: String, content: @Composable () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Text(label, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+        content()
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -377,9 +474,14 @@ fun SettingsScreen(onBack: () -> Unit) {
     var groqKey by remember { mutableStateOf(secureStorage.getGroqApiKey()) }
     var elevenLabsKey by remember { mutableStateOf(secureStorage.getElevenLabsApiKey()) }
     var assemblyAiKey by remember { mutableStateOf(secureStorage.getAssemblyAiApiKey()) }
+    var sonioxKey by remember { mutableStateOf(secureStorage.getSonioxApiKey()) }
     var transcribeLanguage by remember { mutableStateOf(secureStorage.getTranscribeLanguage()) }
     var modelChoice by remember { mutableStateOf(secureStorage.getModelChoice()) }
     var llmChoice by remember { mutableStateOf(secureStorage.getLlmChoice()) }
+    var cleanupPrompt by remember { mutableStateOf(secureStorage.getCleanupPrompt()) }
+    var promptDialogOpen by remember { mutableStateOf(false) }
+    // Keys as loaded from storage: treated as already checked, so only edits trigger a check.
+    val storedKeys = remember { secureStorage.getApiKeys() }
     var langExpanded by remember { mutableStateOf(false) }
     var modelExpanded by remember { mutableStateOf(false) }
     var llmExpanded by remember { mutableStateOf(false) }
@@ -425,9 +527,11 @@ fun SettingsScreen(onBack: () -> Unit) {
                         secureStorage.saveGroqApiKey(groqKey)
                         secureStorage.saveElevenLabsApiKey(elevenLabsKey)
                         secureStorage.saveAssemblyAiApiKey(assemblyAiKey)
+                        secureStorage.saveSonioxApiKey(sonioxKey)
                         secureStorage.saveTranscribeLanguage(transcribeLanguage)
                         secureStorage.saveModelChoice(modelChoice)
                         secureStorage.saveLlmChoice(llmChoice)
+                        secureStorage.saveCleanupPrompt(cleanupPrompt)
                         Log.i("SmartNoteTaker", "Settings Saved. Transcription: $modelChoice ($transcribeLanguage), LLM: $llmChoice")
                         onBack()
                     }) {
@@ -440,86 +544,154 @@ fun SettingsScreen(onBack: () -> Unit) {
         Column(
             modifier = Modifier.fillMaxSize().padding(paddingValues).padding(16.dp).verticalScroll(rememberScrollState())
         ) {
-            Text("Transcription Model", style = MaterialTheme.typography.titleMedium)
-            Box {
-                OutlinedButton(onClick = { modelExpanded = true }, modifier = Modifier.fillMaxWidth()) {
-                    Text("$modelChoice  •  ${CostEstimator.rateLabel(modelChoice)}")
+            // The keyboard records in this app's process, so it needs the mic permission.
+            var hasMic by remember {
+                mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+            }
+            val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasMic = it }
+            if (!hasMic) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "Microphone permission is required for dictation.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }) { Text("Grant") }
                 }
-                DropdownMenu(expanded = modelExpanded, onDismissRequest = { modelExpanded = false }) {
-                    TRANSCRIPTION_PROVIDERS.forEach { choice ->
-                        DropdownMenuItem(
-                            text = { Text("$choice  •  ${CostEstimator.rateLabel(choice)}") },
-                            onClick = {
-                                modelChoice = choice
-                                modelExpanded = false
-                            }
-                        )
-                    }
-                }
+                Spacer(modifier = Modifier.height(8.dp))
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text("Transcription Language", style = MaterialTheme.typography.titleMedium)
-            val selectedLangLabel = TRANSCRIBE_LANGUAGES.firstOrNull { it.second == transcribeLanguage }?.first ?: "Auto-detect"
             // Plain button + popup menu: a DropdownMenu doesn't track its anchor on
             // every scroll frame the way ExposedDropdownMenuBox does (that caused jank).
-            Box {
-                OutlinedButton(onClick = { langExpanded = true }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Language: $selectedLangLabel")
-                }
-                DropdownMenu(expanded = langExpanded, onDismissRequest = { langExpanded = false }) {
-                    TRANSCRIBE_LANGUAGES.forEach { (label, code) ->
-                        DropdownMenuItem(
-                            text = { Text(label) },
-                            onClick = {
-                                transcribeLanguage = code
-                                langExpanded = false
-                            }
-                        )
+            // Buttons show just the choice; rates stay in the menus for comparison.
+            SettingRow("Transcription Model") {
+                Box {
+                    OutlinedButton(onClick = { modelExpanded = true }) { Text(modelChoice) }
+                    DropdownMenu(expanded = modelExpanded, onDismissRequest = { modelExpanded = false }) {
+                        TRANSCRIPTION_PROVIDERS.forEach { choice ->
+                            DropdownMenuItem(
+                                text = { Text("$choice  •  ${CostEstimator.rateLabel(choice)}") },
+                                onClick = {
+                                    modelChoice = choice
+                                    modelExpanded = false
+                                }
+                            )
+                        }
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            Text("LLM Cleanup Model", style = MaterialTheme.typography.titleMedium)
-            Box {
-                OutlinedButton(onClick = { llmExpanded = true }, modifier = Modifier.fillMaxWidth()) {
-                    Text("$llmChoice  •  ${CostEstimator.llmRateLabel(llmChoice)}")
-                }
-                DropdownMenu(expanded = llmExpanded, onDismissRequest = { llmExpanded = false }) {
-                    listOf("OpenAI", "Local (Gemma-4 E2B)", "Local (Gemma-4 E4B)").forEach { choice ->
-                        DropdownMenuItem(
-                            text = { Text("$choice  •  ${CostEstimator.llmRateLabel(choice)}") },
-                            onClick = {
-                                llmChoice = choice
-                                llmExpanded = false
-                            }
-                        )
+            val selectedLangLabel = TRANSCRIBE_LANGUAGES.firstOrNull { it.second == transcribeLanguage }?.first ?: "Auto-detect"
+            SettingRow("Transcription Language") {
+                Box {
+                    OutlinedButton(onClick = { langExpanded = true }) { Text(selectedLangLabel) }
+                    DropdownMenu(expanded = langExpanded, onDismissRequest = { langExpanded = false }) {
+                        TRANSCRIBE_LANGUAGES.forEach { (label, code) ->
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = {
+                                    transcribeLanguage = code
+                                    langExpanded = false
+                                }
+                            )
+                        }
                     }
                 }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            SettingRow("LLM Cleanup Model") {
+                Box {
+                    OutlinedButton(onClick = { llmExpanded = true }) { Text(llmChoice) }
+                    DropdownMenu(expanded = llmExpanded, onDismissRequest = { llmExpanded = false }) {
+                        listOf("OpenAI", "Local (Gemma-4 E2B)", "Local (Gemma-4 E4B)").forEach { choice ->
+                            DropdownMenuItem(
+                                text = { Text("$choice  •  ${CostEstimator.llmRateLabel(choice)}") },
+                                onClick = {
+                                    llmChoice = choice
+                                    llmExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Editable system instruction for the cleanup LLM (cloud and local alike),
+            // edited in a dialog so the long text doesn't dominate the screen.
+            SettingRow("Cleanup prompt") {
+                OutlinedButton(onClick = { promptDialogOpen = true }) {
+                    Text(if (cleanupPrompt == DEFAULT_CLEANUP_PROMPT) "Default" else "Custom")
+                }
+            }
+            if (promptDialogOpen) {
+                var draft by remember { mutableStateOf(cleanupPrompt) }
+                AlertDialog(
+                    onDismissRequest = { promptDialogOpen = false },
+                    title = { Text("Cleanup prompt") },
+                    text = {
+                        Column {
+                            OutlinedTextField(
+                                value = draft,
+                                onValueChange = { draft = it },
+                                minLines = 6,
+                                placeholder = { Text(DEFAULT_CLEANUP_PROMPT) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            TextButton(
+                                onClick = { draft = DEFAULT_CLEANUP_PROMPT },
+                                enabled = draft != DEFAULT_CLEANUP_PROMPT,
+                            ) {
+                                Text("Reset to default")
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            cleanupPrompt = draft.ifBlank { DEFAULT_CLEANUP_PROMPT }
+                            promptDialogOpen = false
+                        }) { Text("Save") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { promptDialogOpen = false }) { Text("Cancel") }
+                    },
+                )
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
             // API key fields: show the one for the selected cloud transcription provider,
-            // plus the OpenAI key whenever cloud cleanup (OpenAI) is selected.
+            // plus the OpenAI key whenever cloud cleanup (OpenAI) is selected. A key is
+            // checked against its provider only when it changes (debounced).
             val showOpenAiKey = modelChoice == PROVIDER_OPENAI || llmChoice == "OpenAI"
             if (showOpenAiKey) {
-                ApiKeyField("OpenAI API Key", openAiKey) { openAiKey = it }
+                // With OpenAI cleanup, checking the cleanup model proves the key too.
+                val openAiProvider = if (llmChoice == "OpenAI") PROVIDER_LLM else PROVIDER_OPENAI
+                val check = rememberKeyCheck(openAiProvider, openAiKey, storedKeys.openai)
+                val note = if (openAiProvider == PROVIDER_LLM) " ($OPENAI_LLM_MODEL available)" else ""
+                ApiKeyField("OpenAI API Key", openAiKey, { openAiKey = it }) { KeyCheckLine("Key", "OpenAI", check, note) }
             }
             if (modelChoice == PROVIDER_DEEPGRAM) {
-                ApiKeyField("Deepgram API Key", deepgramKey) { deepgramKey = it }
-            }
-            if (modelChoice == PROVIDER_GROQ) {
-                ApiKeyField("Groq API Key", groqKey) { groqKey = it }
+                val check = rememberKeyCheck(PROVIDER_DEEPGRAM, deepgramKey, storedKeys.deepgram)
+                ApiKeyField("Deepgram API Key", deepgramKey, { deepgramKey = it }) { KeyCheckLine("Key", "Deepgram", check) }
             }
             if (modelChoice == PROVIDER_ELEVENLABS) {
-                ApiKeyField("ElevenLabs API Key", elevenLabsKey) { elevenLabsKey = it }
+                val check = rememberKeyCheck(PROVIDER_ELEVENLABS, elevenLabsKey, storedKeys.elevenLabs)
+                ApiKeyField("ElevenLabs API Key", elevenLabsKey, { elevenLabsKey = it }) { KeyCheckLine("Key", "ElevenLabs", check) }
             }
             if (modelChoice == PROVIDER_ASSEMBLYAI) {
-                ApiKeyField("AssemblyAI API Key", assemblyAiKey) { assemblyAiKey = it }
+                val check = rememberKeyCheck(PROVIDER_ASSEMBLYAI, assemblyAiKey, storedKeys.assemblyAi)
+                ApiKeyField("AssemblyAI API Key", assemblyAiKey, { assemblyAiKey = it }) { KeyCheckLine("Key", "AssemblyAI", check) }
+            }
+            if (modelChoice == PROVIDER_SONIOX) {
+                val check = rememberKeyCheck(PROVIDER_SONIOX, sonioxKey, storedKeys.soniox)
+                ApiKeyField("Soniox API Key", sonioxKey, { sonioxKey = it }) { KeyCheckLine("Key", "Soniox", check) }
             }
 
             Spacer(modifier = Modifier.height(32.dp))
@@ -591,286 +763,6 @@ fun SettingsScreen(onBack: () -> Unit) {
         }
     }
 }
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun NoteTakerScreen(onOpenSettings: () -> Unit) {
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-    val secureStorage = remember { SecureStorage(context) }
-
-    val apiKeys = remember { secureStorage.getApiKeys() }
-    val transcribeLanguage = remember { secureStorage.getTranscribeLanguage() }
-    var modelChoice by remember { mutableStateOf(secureStorage.getModelChoice()) }
-    var llmChoice by remember { mutableStateOf(secureStorage.getLlmChoice()) }
-
-    // recordMode: null = idle, "write" = dictate & append, "modify" = spoken edit instruction.
-    var recordMode by remember { mutableStateOf<String?>(null) }
-    var statusText by remember { mutableStateOf("Ready") }
-    var notesText by remember { mutableStateOf("") }
-    var downloadProgress by remember { mutableStateOf(0f) }
-    var micLevel by remember { mutableStateOf(0f) }
-    val undoStack = remember { mutableStateListOf<String>() }
-    var processingJob by remember { mutableStateOf<Job?>(null) }
-
-    val wavRecorder = remember { WavRecorder(context) }
-    val aiProcessor = remember { AIProcessor() }
-    val modelDownloader = remember { LocalModelDownloader(context) }
-    val usageTracker = remember { UsageTracker(context) }
-
-    var costMicros by remember { mutableStateOf(usageTracker.totalMicros()) }
-    var showCostBreakdown by remember { mutableStateOf(false) }
-
-    var hasPermission by remember { 
-        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) 
-    }
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
-        hasPermission = isGranted
-    }
-
-    // Live mic level while recording (drives the on-screen indicator).
-    LaunchedEffect(recordMode) {
-        while (recordMode != null) {
-            micLevel = wavRecorder.amplitude
-            kotlinx.coroutines.delay(60)
-        }
-        micLevel = 0f
-    }
-
-    fun keysMissing(): Boolean {
-        val needsTranscribeKey = !isLocalProvider(modelChoice) && apiKeys.keyFor(modelChoice).isEmpty()
-        val needsLlmKey = llmChoice == "OpenAI" && apiKeys.openai.isEmpty()
-        return needsTranscribeKey || needsLlmKey
-    }
-
-    fun startRecording(mode: String) {
-        recordMode = mode
-        statusText = if (mode == "write") "Recording…" else "Listening for edit instruction…"
-        wavRecorder.start()
-    }
-
-    // Stops recording and runs the pipeline. Write => transcribe + cleanup + append;
-    // Modify => transcribe (as an edit instruction) + LLM-rewrite the existing notes.
-    fun stopAndProcess() {
-        val mode = recordMode ?: return
-        recordMode = null
-        statusText = "Processing…"
-        val audioFile = wavRecorder.stop() ?: run { statusText = "Ready"; return }
-        if (audioFile.length() - 44 < MIN_RECORDING_BYTES) {
-            statusText = "Recording too short — hold longer"
-            return
-        }
-        processingJob = coroutineScope.launch {
-            try {
-                val rawText = aiProcessor.transcribe(
-                    choice = modelChoice,
-                    language = transcribeLanguage,
-                    audioFile = audioFile,
-                    wavRecorder = wavRecorder,
-                    modelDownloader = modelDownloader,
-                    keys = apiKeys,
-                    usageTracker = usageTracker,
-                    onStatus = { statusText = it },
-                    onProgress = { p -> downloadProgress = p / 100f },
-                )
-                downloadProgress = 0f
-
-                // Resolve a local LLM only when cleanup/modify runs on-device.
-                val llmFile: File? = if (llmChoice != "OpenAI") {
-                    statusText = "Loading LLM…"
-                    val f = modelDownloader.downloadLlmModel(llmChoice) { p -> downloadProgress = p / 100f }
-                    downloadProgress = 0f
-                    f ?: throw Exception("Failed to load local LLM")
-                } else null
-
-                if (mode == "write") {
-                    statusText = "Cleaning up text…"
-                    val cleanText = if (llmChoice == "OpenAI")
-                        aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker)
-                    else aiProcessor.cleanTextLocal(rawText, llmFile!!)
-                    undoStack.add(notesText)
-                    notesText += if (notesText.isEmpty()) cleanText else "\n\n$cleanText"
-                } else {
-                    statusText = "Applying edit…"
-                    val newText = if (llmChoice == "OpenAI")
-                        aiProcessor.modifyText(notesText, rawText, apiKeys.openai, usageTracker)
-                    else aiProcessor.modifyTextLocal(notesText, rawText, llmFile!!)
-                    undoStack.add(notesText)
-                    notesText = newText.trim()
-                }
-                costMicros = usageTracker.totalMicros()
-                statusText = "Ready"
-            } catch (e: CancellationException) {
-                throw e  // cancelled by the user; cancelActive() has reset the UI
-            } catch (e: Exception) {
-                if (isActive) {
-                    statusText = "Error: ${e.message}"
-                    Log.e("SmartNoteTaker", "Pipeline failed", e)
-                }
-            } finally {
-                downloadProgress = 0f
-                processingJob = null
-            }
-        }
-    }
-
-    // Cancel an in-progress recording (discard) or a running transcription/LLM request.
-    fun cancelActive() {
-        if (recordMode != null) {
-            wavRecorder.stop()
-            recordMode = null
-        }
-        processingJob?.cancel()
-        processingJob = null
-        aiProcessor.cancelInFlight()
-        downloadProgress = 0f
-        statusText = "Cancelled"
-    }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { 
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Image(
-                            painter = painterResource(id = R.drawable.logo),
-                            contentDescription = "CheapWhisper Logo",
-                            modifier = Modifier.size(32.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("CheapWhisper")
-                    }
-                },
-                actions = {
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
-                    }
-                }
-            )
-        },
-        floatingActionButton = {
-            // Bottom-right: total third-party spend; tap to expand a per-provider breakdown.
-            ExtendedFloatingActionButton(
-                onClick = { showCostBreakdown = true },
-                icon = { Icon(Icons.Filled.Info, contentDescription = "Usage cost") },
-                text = { Text(UsageTracker.formatUsd(costMicros)) },
-            )
-        }
-    ) { paddingValues ->
-        if (showCostBreakdown) {
-            CostBreakdownDialog(
-                tracker = usageTracker,
-                onDismiss = { showCostBreakdown = false },
-            )
-        }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.height(48.dp)
-            ) {
-                if (recordMode != null) {
-                    // Live mic-level: the icon grows with the captured audio amplitude.
-                    Icon(
-                        imageVector = Icons.Filled.Mic,
-                        contentDescription = "Recording",
-                        tint = Color.Red,
-                        modifier = Modifier.size((20f + micLevel * 26f).dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-                Text(text = statusText, color = MaterialTheme.colorScheme.primary)
-            }
-            
-            Text("Transcribing with: ${modelChoice}", style = MaterialTheme.typography.bodySmall)
-            Text("LLM Cleanup: ${llmChoice}", style = MaterialTheme.typography.bodySmall)
-            Spacer(modifier = Modifier.height(8.dp))
-            
-            if (downloadProgress > 0f && downloadProgress < 1f) {
-                LinearProgressIndicator(
-                    progress = downloadProgress,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-                )
-            } else {
-                Spacer(modifier = Modifier.height(16.dp))
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                // WRITE: dictate new text (transcribe + cleanup, append to notes).
-                Button(
-                    onClick = {
-                        when {
-                            recordMode == "write" -> stopAndProcess()
-                            recordMode == null -> when {
-                                keysMissing() -> onOpenSettings()
-                                !hasPermission -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                else -> startRecording("write")
-                            }
-                        }
-                    },
-                    enabled = recordMode != "modify" && processingJob == null,
-                    modifier = Modifier.weight(1f).height(56.dp)
-                ) {
-                    Text(if (recordMode == "write") "Stop" else "Write")
-                }
-
-                // MODIFY: speak an edit instruction applied to the existing notes.
-                Button(
-                    onClick = {
-                        when {
-                            recordMode == "modify" -> stopAndProcess()
-                            recordMode == null -> when {
-                                keysMissing() -> onOpenSettings()
-                                !hasPermission -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                else -> startRecording("modify")
-                            }
-                        }
-                    },
-                    // Only available when there is real text to modify.
-                    enabled = recordMode != "write" && processingJob == null && (recordMode == "modify" || notesText.isNotBlank()),
-                    modifier = Modifier.weight(1f).height(56.dp)
-                ) {
-                    Text(if (recordMode == "modify") "Stop" else "Modify")
-                }
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Cancel: abort an in-progress recording or request.
-            if (recordMode != null || processingJob != null) {
-                Button(
-                    onClick = { cancelActive() },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Cancel")
-                }
-            } else {
-                OutlinedButton(
-                    onClick = { if (undoStack.isNotEmpty()) notesText = undoStack.removeAt(undoStack.size - 1) },
-                    enabled = undoStack.isNotEmpty(),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(if (undoStack.isEmpty()) "Undo" else "Undo (${undoStack.size})")
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            OutlinedTextField(
-                value = notesText,
-                onValueChange = { notesText = it },
-                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
-                label = { Text("Your Notes") }
-            )
-        }
-    }
-}
-
 class AIProcessor {
     private val client = OkHttpClient()
 
@@ -917,6 +809,11 @@ class AIProcessor {
             }
             PROVIDER_ASSEMBLYAI -> {
                 transcribeAssemblyAi(audioFile, keys.assemblyAi, language, onStatus)
+            }
+            PROVIDER_SONIOX -> {
+                onStatus("Transcribing (Soniox)…")
+                val (text, seconds) = SonioxRest.transcribe(client, keys.soniox, audioFile, language)
+                Stt(text, seconds)
             }
             else -> {
                 // Local whisper.cpp (tiny / base / small)
@@ -1083,17 +980,34 @@ class AIProcessor {
         throw IOException("AssemblyAI timed out")
     }
 
+    // Loaded whisper.cpp model, kept across calls so live-preview chunks don't reload it
+    // from disk each time. Guarded by [localMutex]; released via [releaseLocalModel].
+    private val localMutex = Mutex()
+    private var localCtx: WhisperContext? = null
+    private var localCtxPath: String? = null
+
     suspend fun transcribeAudioLocal(audioFile: File, modelFile: File, wavRecorder: WavRecorder, language: String): String = withContext(Dispatchers.IO) {
         val floatArray = wavRecorder.decodeWavToFloatArray(audioFile)
-
-        val whisperContext = com.whispercpp.whisper.WhisperContext.createContextFromFile(modelFile.absolutePath)
-        val result = whisperContext.transcribeData(floatArray, language = language, printTimestamp = false)
-        whisperContext.release()
-
-        result.trim()
+        localMutex.withLock {
+            if (localCtxPath != modelFile.absolutePath) {
+                localCtx?.release()
+                localCtx = WhisperContext.createContextFromFile(modelFile.absolutePath)
+                localCtxPath = modelFile.absolutePath
+            }
+            localCtx!!.transcribeData(floatArray, language = language, printTimestamp = false).trim()
+        }
     }
 
-    suspend fun cleanTextLocal(rawText: String, modelFile: File): String = withContext(Dispatchers.IO) {
+    /** Frees the cached local Whisper model (call when a dictation pipeline finishes). */
+    suspend fun releaseLocalModel() = withContext(Dispatchers.IO) {
+        localMutex.withLock {
+            localCtx?.release()
+            localCtx = null
+            localCtxPath = null
+        }
+    }
+
+    suspend fun cleanTextLocal(rawText: String, modelFile: File, prompt: String = DEFAULT_CLEANUP_PROMPT): String = withContext(Dispatchers.IO) {
         if (rawText.isBlank()) return@withContext ""
         
         var resultText = ""
@@ -1102,9 +1016,9 @@ class AIProcessor {
             val engine = FallbackEngine.initializeEngine(modelFile)
             
             val conversation = engine.createConversation(ConversationConfig())
-            val prompt = "You are an assistant that cleans up dictated voice notes. Fix punctuation, grammar, and formatting. Remove filler words (ums, ahs). Do not add new information or conversational filler. Output ONLY the cleaned text.\n\nHere is the raw text to clean:\n${rawText}"
+            val fullPrompt = "$prompt\n\nHere is the raw text to clean:\n${rawText}"
             
-            val responseMsg = conversation.sendMessage(prompt)
+            val responseMsg = conversation.sendMessage(fullPrompt)
             val contents = responseMsg.contents.contents
             resultText = (contents.firstOrNull() as? Content.Text)?.text ?: ""
             
@@ -1118,15 +1032,16 @@ class AIProcessor {
         resultText
     }
 
-    suspend fun cleanText(rawText: String, apiKey: String, usageTracker: UsageTracker): String = withContext(Dispatchers.IO) {
+    suspend fun cleanText(rawText: String, apiKey: String, usageTracker: UsageTracker, prompt: String = DEFAULT_CLEANUP_PROMPT): String = withContext(Dispatchers.IO) {
         if (rawText.isBlank()) return@withContext ""
         val jsonBody = JSONObject().apply {
-            put("model", "gpt-4o-mini")
+            put("model", OPENAI_LLM_MODEL)
+            put("reasoning_effort", OPENAI_REASONING_EFFORT)
             
             val messages = JSONArray()
             messages.put(JSONObject().apply {
                 put("role", "system")
-                put("content", "You are an assistant that cleans up dictated voice notes. Fix punctuation, grammar, and formatting. Remove filler words (ums, ahs). Do not add new information or conversational filler. Output ONLY the cleaned text.")
+                put("content", prompt)
             })
             messages.put(JSONObject().apply {
                 put("role", "user")
@@ -1160,7 +1075,7 @@ class AIProcessor {
         }
     }
 
-    /** Rewrites [existingText] per a spoken [instruction], via OpenAI gpt-4o-mini. */
+    /** Rewrites [existingText] per a spoken [instruction], via the OpenAI cleanup LLM. */
     suspend fun modifyText(existingText: String, instruction: String, apiKey: String, usageTracker: UsageTracker): String =
         openAiChat(
             system = "You are a precise text editor. Apply the user's instruction to the supplied text and output ONLY the revised text — no commentary, preamble, or surrounding quotes.",
@@ -1171,7 +1086,8 @@ class AIProcessor {
 
     private suspend fun openAiChat(system: String, user: String, apiKey: String, usageTracker: UsageTracker): String = withContext(Dispatchers.IO) {
         val jsonBody = JSONObject().apply {
-            put("model", "gpt-4o-mini")
+            put("model", OPENAI_LLM_MODEL)
+            put("reasoning_effort", OPENAI_REASONING_EFFORT)
             val messages = JSONArray()
             messages.put(JSONObject().apply { put("role", "system"); put("content", system) })
             messages.put(JSONObject().apply { put("role", "user"); put("content", user) })
