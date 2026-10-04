@@ -24,3 +24,7 @@ The consolidated app retains `com.example.smartnotetaker`. Eleven non-secret usa
 ## Review fixes and offline recovery (0.3.10)
 
 See [review-fixes.md](review-fixes.md) for the Claude/Codex finding dispositions. The expanded suite has 143 passing offline tests, including streaming timeout/failed-handshake recovery across all five providers, durable retry storage, multiple queued recordings, safe editor matching, active usage reset, compaction, Recents suppression, catalog persistence, tiny-tail handling and non-spaced-script alignment. App/test APK builds and lint pass. Device Opus tests passed before the final follow-up adjustments and are rerun on the final build. Real paid dictation through an actual network outage still requires manual testing; no provider keys or paid tests were used.
+
+## IME deletion compatibility (0.3.11)
+
+Backspace now finishes any previous IME composing region, deletes selected text, otherwise removes a Unicode code point with UTF-16/key-event fallbacks. Hold-to-repeat stays bound to its starting input connection and stops on focus loss or recording; deletion is disabled during processing. Six targeted Robolectric tests passed, as did lint and app/test APK builds. A no-network instrumentation test on the OnePlus Android 13 device passed against a native EditText containing pre-existing text, selection and composing emoji. No paid dictation or user text was used. Other apps with custom editors still need user verification.

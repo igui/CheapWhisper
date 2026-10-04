@@ -122,6 +122,7 @@ class VoiceKeyboardService : InputMethodService() {
     // View refs kept so state can be refreshed outside onCreateInputView.
     private var micButton: ImageButton? = null
     private var modifyButton: ImageButton? = null
+    private var deleteButton: ImageButton? = null
     private var cancelButton: ImageButton? = null
     private var retryButton: ImageButton? = null
     private var tvStatus: TextView? = null
@@ -156,7 +157,7 @@ class VoiceKeyboardService : InputMethodService() {
             b?.let { it.isEnabled = enabled; it.alpha = if (enabled) 1f else 0.4f }
         }
         if (!isUserUnlocked()) {
-            set(micButton, false); set(modifyButton, false)
+            set(micButton, false); set(modifyButton, false); set(deleteButton, false)
             cancelButton?.visibility = View.GONE
             retryButton?.visibility = View.GONE
             return
@@ -164,6 +165,7 @@ class VoiceKeyboardService : InputMethodService() {
         // The actively-held record button must stay enabled to receive its release event.
         set(micButton, (recordMode == null && !processing) || recordMode == MODE_WRITE)
         set(modifyButton, (recordMode == null && !processing && readFieldText().isNotBlank()) || recordMode == MODE_MODIFY)
+        set(deleteButton, recordMode == null && !processing)
         cancelButton?.visibility = if (processing) View.VISIBLE else View.GONE
         // Retry replaces Cancel in the same corner; only one shows at a time.
         retryButton?.visibility = if (!processing && recordMode == null && pendingRetry != null) View.VISIBLE else View.GONE
@@ -229,11 +231,13 @@ class VoiceKeyboardService : InputMethodService() {
      * Stop editor-bound work on focus loss; accepted recordings remain saved for retry.
      */
     override fun onFinishInputView(finishingInput: Boolean) {
+        stopDeleting()
         cancelCurrent(silent = true)
         super.onFinishInputView(finishingInput)
     }
 
     override fun onFinishInput() {
+        stopDeleting()
         cancelCurrent(silent = true)
         super.onFinishInput()
     }
@@ -291,29 +295,20 @@ class VoiceKeyboardService : InputMethodService() {
     // characters, then switches to whole words once it has been held a while.
     private val deleteHandler = Handler(Looper.getMainLooper())
     private var deleteRepeatCount = 0
+    private var deleteConnection: InputConnection? = null
+    private var suppressDeleteClick = false
     private val deleteRunnable = object : Runnable {
         override fun run() {
-            val ic = currentInputConnection ?: return
+            val connection = deleteConnection ?: return
+            if (currentInputConnection !== connection || processing || recordMode != null) { stopDeleting(); return }
             deleteRepeatCount++
-            // First ~20 repeats delete characters; after that, accelerate to words.
-            if (deleteRepeatCount < 20) {
-                ic.deleteSurroundingText(1, 0)
-                deleteHandler.postDelayed(this, (120L - deleteRepeatCount * 4L).coerceAtLeast(40L))
-            } else {
-                deleteLastWord(ic)
-                deleteHandler.postDelayed(this, 90L)
-            }
+            if (!EditorBackspace.delete(connection, wholeWord = deleteRepeatCount >= 20)) { stopDeleting(); return }
+            deleteHandler.postDelayed(this, if (deleteRepeatCount >= 20) 90L else (120L - deleteRepeatCount * 4L).coerceAtLeast(40L))
         }
     }
-
-    /** Deletes the run of trailing whitespace plus the word before the cursor. */
-    private fun deleteLastWord(ic: InputConnection) {
-        val before = ic.getTextBeforeCursor(64, 0) ?: return
-        if (before.isEmpty()) return
-        var i = before.length
-        while (i > 0 && before[i - 1].isWhitespace()) i--
-        while (i > 0 && !before[i - 1].isWhitespace()) i--
-        ic.deleteSurroundingText((before.length - i).coerceAtLeast(1), 0)
+    private fun stopDeleting() {
+        deleteHandler.removeCallbacks(deleteRunnable)
+        deleteConnection = null
     }
 
     // ---------------------------------------------------------------- live text
@@ -438,6 +433,7 @@ class VoiceKeyboardService : InputMethodService() {
     private fun startRec(mode: String, activeButton: View) {
         restoreJob?.cancel()
         retryConnections.clear(); confirmationId = null; confirmationConnection = null
+        stopDeleting()
         recordMode = mode
         previewText = ""
         fieldBeforeDictation = readFieldText()
@@ -789,6 +785,7 @@ class VoiceKeyboardService : InputMethodService() {
 
         micButton = btnMic
         modifyButton = btnModify
+        deleteButton = btnDelete
         cancelButton = btnCancel
         retryButton = btnRetry
         tvStatus = status
@@ -826,20 +823,30 @@ class VoiceKeyboardService : InputMethodService() {
             requestHideSelf(0)
         }
 
-        btnDelete.setOnTouchListener { v, event ->
+        btnDelete.setOnClickListener {
+            if (!suppressDeleteClick && !processing && recordMode == null) currentInputConnection?.let { EditorBackspace.delete(it) }
+        }
+        btnDelete.setOnTouchListener { view, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    deleteRepeatCount = 0
-                    currentInputConnection?.deleteSurroundingText(1, 0)  // immediate single delete on tap
-                    deleteHandler.postDelayed(deleteRunnable, 400L)       // begin repeating after a hold
+                    stopDeleting()
+                    if (!processing && recordMode == null && isUserUnlocked()) {
+                        deleteRepeatCount = 0
+                        deleteConnection = currentInputConnection
+                        deleteConnection?.let { EditorBackspace.delete(it) }
+                        deleteHandler.postDelayed(deleteRunnable, 400L)
+                    }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    deleteHandler.removeCallbacks(deleteRunnable)
-                    if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                    stopDeleting()
+                    if (event.actionMasked == MotionEvent.ACTION_UP) {
+                        suppressDeleteClick = true
+                        try { view.performClick() } finally { suppressDeleteClick = false }
+                    }
                     true
                 }
-                else -> false
+                else -> true
             }
         }
 
