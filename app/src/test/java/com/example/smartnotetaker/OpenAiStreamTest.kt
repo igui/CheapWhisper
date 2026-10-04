@@ -153,4 +153,27 @@ class OpenAiStreamTest {
         val failed = try { kotlinx.coroutines.withContext(Dispatchers.IO) { s.finish() }; false } catch (e: Exception) { true }
         assertTrue("finish() should throw after a session error", failed)
     }
+    @Test
+    fun `quota error after final commit must fail rather than acknowledge silence`() = runBlocking {
+        server.expectUpgrade()
+        val s = stream()
+        open(s)
+        val finishing = async(Dispatchers.IO) { runCatching { s.finish() } }
+        server.nextText()
+        server.send("""{"type":"error","error":{"code":"insufficient_quota","message":"Quota exhausted"}}""")
+        assertTrue(finishing.await().isFailure)
+    }
+
+    @Test
+    fun `failed audio item must fall back rather than return other completed text`() = runBlocking {
+        server.expectUpgrade()
+        val s = stream()
+        open(s)
+        val finishing = async(Dispatchers.IO) { runCatching { s.finish() } }
+        server.nextText()
+        server.send(event("input_audio_buffer.committed", "item_id" to "failed-item"))
+        server.send(event("conversation.item.input_audio_transcription.failed", "item_id" to "failed-item"))
+        assertTrue(finishing.await().exceptionOrNull() is java.io.IOException)
+    }
+
 }

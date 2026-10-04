@@ -32,7 +32,7 @@ class ApiKeyValidatorTest {
         assertEquals("/api/v1/key", request.path)
         assertEquals("Bearer sk-test-key", request.getHeader("Authorization"))
         server.enqueue(MockResponse().setResponseCode(429))
-        assertTrue(validate(PROVIDER_OPENROUTER) is ApiKeyValidator.Outcome.Invalid)
+        assertTrue(validate(PROVIDER_OPENROUTER) is ApiKeyValidator.Outcome.Unreachable)
     }
     @Test fun `OpenRouter error responses do not expose provider payloads`() {
         server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":{"message":"sk-test-key"}}"""))

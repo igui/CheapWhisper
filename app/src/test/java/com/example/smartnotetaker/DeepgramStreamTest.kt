@@ -105,7 +105,7 @@ class DeepgramStreamTest {
     }
 
     @Test
-    fun `finish times out gracefully and returns the text so far`() = runBlocking {
+    fun `finish throws on timeout even when partial finals exist`() = runBlocking {
         server.expectUpgrade()
         val s = stream()
         s.start()
@@ -113,9 +113,9 @@ class DeepgramStreamTest {
         server.send(results("partial answer", true))
         recorder.await(1)
         val t0 = System.currentTimeMillis()
-        val text = withContext(Dispatchers.IO) { s.finish() }  // server never closes
+        val error = runCatching { withContext(Dispatchers.IO) { s.finish() } }.exceptionOrNull()
         val elapsed = System.currentTimeMillis() - t0
-        assertEquals("partial answer", text)
+        assertTrue("Incomplete streaming must fall back to the WAV", error is java.io.IOException)
         assertTrue("timed out after ${elapsed}ms", elapsed in 7_000..12_000)
     }
 }

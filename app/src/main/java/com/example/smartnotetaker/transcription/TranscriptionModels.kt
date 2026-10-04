@@ -37,6 +37,26 @@ object TranscriptionCatalog {
     fun all(context: Context): List<TranscriptionModel> = context.assets.open("openrouter-models.json").bufferedReader().use {
         JSONObject(it.readText()).getJSONArray("models").objects().map(::TranscriptionModel)
     }
+    private val catalogLock = Any()
+    private fun catalogVersion(context: Context): Int = context.packageManager.getPackageInfo(context.packageName, 0).versionCode
+    fun available(context: Context): List<TranscriptionModel> = synchronized(catalogLock) {
+        val file = android.util.AtomicFile(java.io.File(context.noBackupFilesDir, "openrouter-catalog.json"))
+        val bundled = all(context)
+        val cached = runCatching { JSONObject(String(file.readFully(), Charsets.UTF_8)) }.getOrNull() ?: return@synchronized bundled
+        val models = cached.optJSONArray("models")?.objects()?.map(::TranscriptionModel).orEmpty()
+        if (models.isEmpty()) return@synchronized bundled
+        if (cached.optInt("version", -1) == catalogVersion(context)) return@synchronized models
+        val updated = (models.map { old -> bundled.firstOrNull { it.id == old.id } ?: old } + bundled).distinctBy { it.id }
+        persist(context, updated)
+        updated
+    }
+    fun persist(context: Context, models: List<TranscriptionModel>) = synchronized(catalogLock) {
+        val file = android.util.AtomicFile(java.io.File(context.noBackupFilesDir, "openrouter-catalog.json"))
+        val json = JSONObject().put("version", catalogVersion(context)).put("models", JSONArray(models.map { it.metadata }))
+        val output = file.startWrite()
+        try { output.write(json.toString().toByteArray(Charsets.UTF_8)); file.finishWrite(output) }
+        catch (e: Exception) { file.failWrite(output); throw e }
+    }
     fun family(id: String): String = when {
         id.startsWith("microsoft/mai-transcribe") -> "microsoft/mai"
         id.startsWith("openai/whisper") -> "openai/whisper"

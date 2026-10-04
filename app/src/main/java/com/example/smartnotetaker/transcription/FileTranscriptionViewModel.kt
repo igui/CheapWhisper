@@ -28,7 +28,7 @@ class FileTranscriptionViewModel internal constructor(application: Application, 
     var playbackMs: Long = 0
     var exportDraft: String = ""
     init {
-        val models = TranscriptionCatalog.distinct(TranscriptionCatalog.all(application))
+        val models = TranscriptionCatalog.distinct(TranscriptionCatalog.available(application))
         state.value = State(models = models, model = TranscriptionCatalog.resolve(models, TranscriptionCatalog.DEFAULT))
         reloadSettings()
     }
@@ -50,7 +50,7 @@ class FileTranscriptionViewModel internal constructor(application: Application, 
         }
     }
     fun acceptShare(intent: Intent) {
-        if (intent.action != Intent.ACTION_SEND) return
+        if (intent.action != Intent.ACTION_SEND || intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
         try { importAudio(SharedRecording.uri(intent), autoTranscribe = true) }
         catch (e: Exception) { state.update { it.copy(status = e.message ?: "Invalid audio attachment.") } }
     }
@@ -59,14 +59,17 @@ class FileTranscriptionViewModel internal constructor(application: Application, 
         cancel(); val ticket = ++generation
         state.update { it.copy(busy = true, status = "Importing audio…") }
         job = viewModelScope.launch {
+            var imported: ImportedAudio? = null
+            var adopted = false
             try {
                 optionsSave?.join()
                 val options = withContext(Dispatchers.IO) { dependencies.options() }
                 if (ticket != generation) return@launch
                 state.update { it.copy(model = TranscriptionCatalog.resolve(it.models, options.first), language = options.second, ready = true) }
-                val audio = withContext(Dispatchers.IO) { dependencies.importAudio(uri) }
+                val audio = withContext(Dispatchers.IO) { dependencies.importAudio(uri).also { imported = it } }
                 if (ticket != generation) { withContext(Dispatchers.IO) { audio.file.delete() }; return@launch }
                 val previous = state.value.audio; playbackMs = 0
+                adopted = true
                 state.update { it.copy(audio = audio, transcript = null, resultSettings = null, status = "Audio imported") }
                 withContext(Dispatchers.IO) { previous?.file?.delete() }
                 if (ticket != generation) return@launch
@@ -74,6 +77,7 @@ class FileTranscriptionViewModel internal constructor(application: Application, 
                 if (autoTranscribe) transcribe()
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (ticket == generation) state.update { it.copy(busy = false, status = if (e is SecurityException) "Audio access expired. Share it again." else e.message ?: "Could not import audio.") } }
+            finally { if (!adopted) withContext(NonCancellable + Dispatchers.IO) { imported?.file?.delete() } }
         }
     }
 
@@ -105,6 +109,7 @@ class FileTranscriptionViewModel internal constructor(application: Application, 
         try {
             val models = withContext(Dispatchers.IO) { TranscriptionCatalog.merge(OpenRouterApi().catalog().getJSONArray("data"), TranscriptionCatalog.all(getApplication())) }
             require(models.isNotEmpty())
+            withContext(Dispatchers.IO) { TranscriptionCatalog.persist(getApplication(), models) }
             state.update { it.copy(models = models, model = TranscriptionCatalog.resolve(models, it.model?.id ?: TranscriptionCatalog.DEFAULT), catalog = "Live catalog · ${models.size} model families; AA snapshot 2026-10-03") }
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) { state.update { it.copy(catalog = "Refresh unavailable · keeping current catalog") } }

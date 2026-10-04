@@ -17,7 +17,7 @@ class TranscriptionEngine(private val context: Context, private val api: OpenRou
             pcm.inputStream().buffered().use { input ->
                 while (consumed < pcm.length()) {
                     currentCoroutineContext().ensureActive()
-                    val size = minOf(model.maxChunkSeconds * 32000L, pcm.length() - consumed).toInt()
+                    val size = audioChunkSize(pcm.length() - consumed, model.maxChunkSeconds * 32000)
                     val chunk = File.createTempFile("upload-", ".wav", context.cacheDir)
                     try {
                         chunk.outputStream().buffered().use { output ->
@@ -40,4 +40,9 @@ class TranscriptionEngine(private val context: Context, private val api: OpenRou
             result.finish()
         } finally { pcm.delete() }
     }
+}
+
+internal fun audioChunkSize(remaining: Long, maximum: Int): Int {
+    val tail = remaining - maximum
+    return if (tail in 1 until 32000) (remaining - 32000).toInt() else minOf(maximum.toLong(), remaining).toInt()
 }

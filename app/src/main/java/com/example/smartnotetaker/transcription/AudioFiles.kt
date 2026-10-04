@@ -59,10 +59,11 @@ object AudioFiles {
                 file.delete()
                 return ImportedAudio(normalized, name, (normalized.length() - 44) * 1000 / 32000)
             }
-            val duration = MediaMetadataRetriever().use {
-                it.setDataSource(file.absolutePath)
-                it.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: throw IOException("Android could not read this audio format.")
-            }
+            val retriever = MediaMetadataRetriever()
+            val duration = try {
+                retriever.setDataSource(file.absolutePath)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: throw IOException("Android could not read this audio format.")
+            } finally { retriever.release() }
             require(duration in 1..7200000) { "Choose audio under two hours." }
             currentCoroutineContext().ensureActive()
             return ImportedAudio(file, name, duration)

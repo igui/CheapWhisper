@@ -67,11 +67,11 @@ class SonioxStream(
             // Soniox closes the socket itself after sending the finished response.
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                done.complete(finalSnapshot)
+                done.completeExceptionally(IOException("Soniox closed before transcription completion (code $code)"))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                done.complete(finalSnapshot)
+                done.completeExceptionally(IOException("Soniox closed before transcription completion (code $code)"))
             }
         })
         ws = socket
@@ -107,16 +107,16 @@ class SonioxStream(
     override suspend fun finish(): String {
         ws?.send("")
         return withTimeoutOrNull(8_000) { done.await() } ?: run {
-            Log.w(TAG, "Timed out waiting for Soniox to finish; using text so far")
+            Log.w(TAG, "Timed out waiting for Soniox to finish; falling back to recorded audio")
             ws?.cancel()
-            finalSnapshot
+            throw IOException("Timed out waiting for transcription completion")
         }
     }
 
     /** Drops the connection immediately, discarding any pending results. */
     override fun cancel() {
-        ws?.cancel()
         done.complete(finalSnapshot)
+        ws?.cancel()
     }
 
     private fun handle(text: String) {

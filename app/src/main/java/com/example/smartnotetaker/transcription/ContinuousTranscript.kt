@@ -13,13 +13,21 @@ class ContinuousTranscript(transcript: AudioTranscript) {
         var cursor = 0
         words = transcript.cues.mapIndexedNotNull { index, cue ->
             val word = cue.text.trim()
-            val start = if (word.isEmpty()) -1 else text.indexOf(word, cursor, ignoreCase = true)
+            var start = if (word.isEmpty()) -1 else text.indexOf(word, cursor, ignoreCase = true)
+            while (start >= 0 && ((requiresBoundary(word.first()) && start > 0 && requiresBoundary(text[start - 1])) ||
+                (requiresBoundary(word.last()) && start + word.length < text.length && requiresBoundary(text[start + word.length])))) {
+                start = text.indexOf(word, start + 1, ignoreCase = true)
+            }
             if (start < 0) null else {
                 cursor = start + word.length
                 TranscriptWordRange(index, start, cursor, cue.startMs)
             }
         }
     }
+    private fun requiresBoundary(character: Char): Boolean = character.isDigit() || Character.UnicodeScript.of(character.code) in setOf(
+        Character.UnicodeScript.LATIN, Character.UnicodeScript.CYRILLIC, Character.UnicodeScript.GREEK,
+        Character.UnicodeScript.ARABIC, Character.UnicodeScript.HEBREW
+    )
     fun highlighted(active: Int, background: Color, foreground: Color): AnnotatedString = buildAnnotatedString {
         append(text)
         words.forEach { word ->

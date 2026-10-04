@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -105,11 +106,11 @@ class OpenAiStream(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                done.complete(finalSnapshot)
+                done.completeExceptionally(IOException("OpenAi closed before transcription completion (code $code)"))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                done.complete(finalSnapshot)
+                done.completeExceptionally(IOException("OpenAi closed before transcription completion (code $code)"))
             }
         })
     }
@@ -134,9 +135,9 @@ class OpenAiStream(
             if (sessionReady) ws?.send(COMMIT_EVENT) else commitRequested = true
         }
         val result = withTimeoutOrNull(8_000) { done.await() } ?: run {
-            Log.w(TAG, "Timed out waiting for OpenAI to finish; using text so far")
+            Log.w(TAG, "Timed out waiting for OpenAI to finish; falling back to recorded audio")
             ws?.cancel()
-            return finalSnapshot
+            throw IOException("Timed out waiting for transcription completion")
         }
         ws?.close(1000, null)  // OpenAI keeps the session open until the client closes it.
         return result
@@ -144,8 +145,8 @@ class OpenAiStream(
 
     /** Drops the connection immediately, discarding any pending results. */
     override fun cancel() {
-        ws?.cancel()
         done.complete(finalSnapshot)
+        ws?.cancel()
     }
 
     private fun sessionConfig(): JSONObject {
@@ -203,11 +204,16 @@ class OpenAiStream(
             }
             "conversation.item.input_audio_transcription.failed" -> {
                 Log.w(TAG, "Transcription failed: ${json.optJSONObject("error")?.optString("message")}")
-                itemFinished(json.optString("item_id"))
+                done.completeExceptionally(IOException("OpenAI could not transcribe an audio item"))
+                ws?.cancel()
             }
             "error" -> {
                 val message = json.optJSONObject("error")?.optString("message") ?: text
-                if (finishing) {
+                val code = json.optJSONObject("error")?.optString("code").orEmpty()
+                val emptyCommit = code == "input_audio_buffer_commit_empty" ||
+                    (code.isBlank() && message.startsWith("Error committing input audio buffer:") &&
+                        ("buffer too small" in message || "buffer is empty" in message))
+                if (finishing && emptyCommit) {
                     // Typically "buffer is empty"/"buffer too small": VAD had already committed
                     // everything, so there is no extra item to wait for.
                     Log.i(TAG, "Error after final commit (ignored): $message")

@@ -58,6 +58,14 @@ class AutomaticShareTest {
             vm.reloadSettings(); drain(); assertEquals(1,fake.calls.size)
         } finally { cleanup(vm) }
     }
+    @Test fun reopeningShareFromRecentsDoesNotUploadAgain() {
+        val fake = Fake(app); val vm = FileTranscriptionViewModel(app,fake)
+        try {
+            vm.acceptShare(share("history.opus").addFlags(Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY))
+            drain(); assertTrue(fake.calls.isEmpty()); assertNull(vm.ui.value.audio)
+        } finally { cleanup(vm) }
+    }
+
     @Test fun manualImportStillWaitsForTranscribeButton() {
         val fake = Fake(app); val vm = FileTranscriptionViewModel(app,fake)
         try { vm.import(Uri.parse("content://voice.example/manual.opus")); await { vm.ui.value.audio != null && !vm.ui.value.busy }; assertTrue(fake.calls.isEmpty()) }

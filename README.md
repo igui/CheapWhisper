@@ -20,8 +20,7 @@ Package name: `com.example.smartnotetaker` (the app shows as "CheapWhisper").
     every 6 s, and appends it.
   - If a stream dies mid-dictation the recorded WAV is sent as a one-shot request instead.
 - **Cancel**: a red X (or tapping the status line) aborts a recording or an in-flight request.
-- **Retry** if transcription or cleanup fails (e.g. no network): the recording is kept and a Retry button re-runs only the failed stage, no need to speak again.
-  Losing focus or hiding the keyboard also cancels whatever is running.
+- **Retry / offline recovery**: accepted recordings are saved privately before processing. Network/stream failures retain the audio and any completed transcript across service restarts. Streaming timeouts do not count as successful silence; the full WAV is used as fallback. When connectivity returns, pending offline dictation resumes only in its original live, unchanged editor. In a later editor session, tap Retry twice to confirm applying the recording to the matching field. Changing fields cancels processing and keeps accepted audio for recovery.
 - **Cost tracking**: cumulative spend per provider, shown on the keyboard and in Settings, with
   a per-provider breakdown and a reset button. Transcription is metered on the duration the
   provider reports (falling back to the WAV length); the OpenAI LLM is metered on returned
@@ -161,3 +160,14 @@ ANDROID_HOME=/opt/android-sdk ./gradlew :app:testDebugUnitTest :app:lintDebug :a
 ```
 
 The suite covers provider regressions, shared-audio lifecycle, cancellation, model selection, key metadata validation, exact usage arithmetic, timing fallback, continuous-text alignment and result provenance. Synthetic Ogg/Opus and stereo WebM/Opus fixtures are tested locally on a device without provider calls. See [verification details](docs/unification-verification.md).
+
+## Recovery and review fixes (0.3.10)
+
+- Accepted keyboard audio is copied to a credential-protected, no-backup retry journal before any network/cleanup work. No API keys are stored in the journal. It retains the original model/provider, language, cleanup choice/prompt, source editor/text and completed raw transcript. Multiple pending recordings are retained; recovery selects a recording matching the current editor.
+- Automatic network recovery is attempted at most once per saved item in the original live input connection while the keyboard is visible. Any later user edit/selection change or new recording disarms it. Editor IDs alone are not trusted across chats. Restored/new sessions require explicit confirmation via a second Retry tap. Changed Modify content must be restored before retry; text is rechecked again before applying the result. Hold Retry to discard a saved recording that is no longer wanted.
+- Failed/canceled retries discard composing text through its original input connection. Old streaming callbacks cannot preview into a new editor. New short taps do not delete pending audio.
+- Usage reset preserves genuinely active request records while clearing old interrupted history. Completed history compacts to exact model/cost aggregates plus recent requests; keyboard cost reads run off the UI thread.
+- OpenRouter keyboard requests use the same longer, redirect-disabled timeout policy as file uploads. Refreshed model metadata persists for subsequent app sessions and the keyboard.
+- Android network validation is only a hint for automatic recovery, never a hard gate on manual processing. A storage failure reports that retry is unavailable but still permits processing from the current recording. Malformed retry rows are skipped; unreadable JSON is preserved separately for recovery.
+- Non-Opus metadata extraction uses `release()` for Android 8/9 compatibility. Recents replay cannot automatically resubmit an old share. Canceling during import cleans unadopted audio. Tiny final chunks are redistributed so remaining audio is not submitted as a sub-second tail.
+- Leaving Settings with an invalid/unreachable replacement OpenRouter key preserves the old key, saves other edits, shows a short message and exits. Temporary 429/5xx errors are labeled unreachable, not invalid.

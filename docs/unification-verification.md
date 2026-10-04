@@ -20,3 +20,7 @@ Live model accuracy, latency, language coverage, timestamp support and billing r
 ## Local migration
 
 The consolidated app retains `com.example.smartnotetaker`. Eleven non-secret usage records were merged from the superseded AudioScribe installation by request ID and the copy verified. AudioScribe was disabled, not uninstalled, preserving its data. Its per-package encrypted key was not read or transferred; users must enter their OpenRouter key once in CheapWhisper. Existing CheapWhisper credentials remain in its original encrypted preferences.
+
+## Review fixes and offline recovery (0.3.10)
+
+See [review-fixes.md](review-fixes.md) for the Claude/Codex finding dispositions. The expanded suite has 143 passing offline tests, including streaming timeout/failed-handshake recovery across all five providers, durable retry storage, multiple queued recordings, safe editor matching, active usage reset, compaction, Recents suppression, catalog persistence, tiny-tail handling and non-spaced-script alignment. App/test APK builds and lint pass. Device Opus tests passed before the final follow-up adjustments and are rerun on the final build. Real paid dictation through an actual network outage still requires manual testing; no provider keys or paid tests were used.

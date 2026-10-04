@@ -3,6 +3,7 @@ package com.example.smartnotetaker
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -94,11 +95,11 @@ class AssemblyAiStream(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                complete()
+                done.completeExceptionally(IOException("AssemblyAi closed before transcription completion (code $code)"))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                complete()
+                done.completeExceptionally(IOException("AssemblyAi closed before transcription completion (code $code)"))
             }
         })
     }
@@ -124,16 +125,16 @@ class AssemblyAiStream(
         flushAudio()
         ws?.send("""{"type":"Terminate"}""")
         return withTimeoutOrNull(8_000) { done.await() } ?: run {
-            Log.w(TAG, "Timed out waiting for AssemblyAI to terminate; using text so far")
+            Log.w(TAG, "Timed out waiting for AssemblyAI to terminate; falling back to recorded audio")
             ws?.cancel()
-            finalSnapshot
+            throw IOException("Timed out waiting for transcription completion")
         }
     }
 
     /** Drops the connection immediately, discarding any pending results. */
     override fun cancel() {
-        ws?.cancel()
         done.complete(finalSnapshot)
+        ws?.cancel()
     }
 
     /** Sends whatever audio is still coalescing, padded with silence up to the 50 ms minimum. */

@@ -547,15 +547,16 @@ fun SettingsScreen(onBack: () -> Unit) {
             try {
                 val candidate = openRouterKey.trim()
                 val stored = withContext(Dispatchers.IO) { secureStorage.getOpenRouterApiKey() }
+                var acceptedKey = candidate
                 if (candidate != stored && candidate.isNotBlank()) {
                     when (val result = ApiKeyValidator.validate(PROVIDER_OPENROUTER, candidate)) {
                         ApiKeyValidator.Outcome.Valid -> Unit
-                        is ApiKeyValidator.Outcome.Invalid -> { openRouterSaveError = result.reason; return@launch }
-                        is ApiKeyValidator.Outcome.Unreachable -> { openRouterSaveError = result.reason; return@launch }
+                        is ApiKeyValidator.Outcome.Invalid -> { acceptedKey = stored; openRouterSaveError = "OpenRouter key unchanged: ${result.reason}" }
+                        is ApiKeyValidator.Outcome.Unreachable -> { acceptedKey = stored; openRouterSaveError = "OpenRouter key unchanged: ${result.reason}" }
                     }
                 }
                 withContext(Dispatchers.IO) {
-                    if (candidate != stored) secureStorage.saveOpenRouterApiKey(candidate)
+                    if (acceptedKey != stored) secureStorage.saveOpenRouterApiKey(acceptedKey)
                     secureStorage.saveOpenAiApiKey(openAiKey)
                     secureStorage.saveDeepgramApiKey(deepgramKey)
                     secureStorage.saveGroqApiKey(groqKey)
@@ -567,6 +568,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                     secureStorage.saveLlmChoice(llmChoice)
                     secureStorage.saveCleanupPrompt(cleanupPrompt)
                 }
+                if (openRouterSaveError.isNotEmpty()) android.widget.Toast.makeText(context, openRouterSaveError, android.widget.Toast.LENGTH_LONG).show()
                 onBack()
             } catch (e: CancellationException) { throw e }
             catch (_: Exception) { openRouterSaveError = "Could not save settings. Please try again." }
@@ -790,10 +792,12 @@ fun SettingsScreen(onBack: () -> Unit) {
 }
 class AIProcessor {
     private val client = OkHttpClient()
+    private val openRouterClient = OpenRouterApi.defaultClient()
 
     /** Aborts any in-flight HTTP calls — used to cancel a running transcription/LLM request. */
     fun cancelInFlight() {
         client.dispatcher.cancelAll()
+        openRouterClient.dispatcher.cancelAll()
     }
 
     /** A transcript plus the provider-reported billed audio duration (seconds), if any. */
@@ -817,8 +821,8 @@ class AIProcessor {
     ): String {
         if (choice == PROVIDER_OPENROUTER) {
             val context = usageTracker.appContext
-            val model = TranscriptionCatalog.resolve(TranscriptionCatalog.distinct(TranscriptionCatalog.all(context)), keys.openrouterModel)
-            return TranscriptionEngine(context, OpenRouterApi(client)).transcribe(audioFile, model, language, keys.openrouter) { status ->
+            val model = TranscriptionCatalog.resolve(TranscriptionCatalog.distinct(TranscriptionCatalog.available(context)), keys.openrouterModel)
+            return TranscriptionEngine(context, OpenRouterApi(openRouterClient)).transcribe(audioFile, model, language, keys.openrouter) { status ->
                 android.os.Handler(android.os.Looper.getMainLooper()).post { onStatus(status) }
             }.text
         }

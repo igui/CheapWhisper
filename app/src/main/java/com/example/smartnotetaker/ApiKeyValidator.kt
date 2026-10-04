@@ -59,7 +59,10 @@ object ApiKeyValidator {
                 ).verifyKey(trimmed)
                 Outcome.Valid
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: com.example.smartnotetaker.transcription.OpenRouterApi.HttpError) { Outcome.Invalid("HTTP ${e.status}: key could not be verified") }
+            catch (e: com.example.smartnotetaker.transcription.OpenRouterApi.HttpError) {
+                if (e.status == 429 || e.status >= 500) Outcome.Unreachable("OpenRouter unavailable (HTTP ${e.status})")
+                else Outcome.Invalid("HTTP ${e.status}: key could not be verified")
+            }
             catch (_: IllegalArgumentException) { Outcome.Invalid("Invalid key format") }
             catch (_: Exception) { Outcome.Unreachable("Could not validate OpenRouter key") }
         }

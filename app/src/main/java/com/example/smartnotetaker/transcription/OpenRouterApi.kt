@@ -36,9 +36,11 @@ class OpenRouterApi(private val client: OkHttpClient = defaultClient(), private 
         suspend fun submit(timestamps: Boolean): Reply {
             val request = request(model, language, key, audio, timestamps)
             val id = usage.begin(model, seconds)
-            val reply = try { execute(request) } catch (e: HttpError) { usage.reject(id); throw e }
-            usage.complete(id, reply.json.optJSONObject("usage"), reply.generation)
-            return reply
+            try {
+                val reply = try { execute(request) } catch (e: HttpError) { usage.reject(id); throw e }
+                usage.complete(id, reply.json.optJSONObject("usage"), reply.generation)
+                return reply
+            } finally { usage.release(id) }
         }
         return try { submit(true) } catch (e: HttpError) {
             if (!e.unsupportedTimestamps) throw e
