@@ -51,6 +51,21 @@ object ApiKeyValidator {
     suspend fun validate(provider: String, key: String): Outcome {
         val trimmed = key.trim()
         if (trimmed.isEmpty()) return Outcome.Invalid("No key")
+        if (provider == PROVIDER_OPENROUTER) {
+            return try {
+                com.example.smartnotetaker.transcription.OpenRouterApi(
+                    client.newBuilder().followRedirects(false).followSslRedirects(false).build(),
+                    url("https://openrouter.ai", "/api/v1")
+                ).verifyKey(trimmed)
+                Outcome.Valid
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: com.example.smartnotetaker.transcription.OpenRouterApi.HttpError) {
+                if (e.status == 429 || e.status >= 500) Outcome.Unreachable("OpenRouter unavailable (HTTP ${e.status})")
+                else Outcome.Invalid("HTTP ${e.status}: key could not be verified")
+            }
+            catch (_: IllegalArgumentException) { Outcome.Invalid("Invalid key format") }
+            catch (_: Exception) { Outcome.Unreachable("Could not validate OpenRouter key") }
+        }
         val request = try {
             buildRequest(provider, trimmed)
         } catch (e: IllegalArgumentException) {

@@ -3,6 +3,7 @@ package com.example.smartnotetaker
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -39,6 +40,7 @@ class DeepgramStream(
     private var ws: WebSocket? = null
     private val finals = StringBuilder()   // touched only on OkHttp's reader thread
     @Volatile private var finalSnapshot = ""
+    @Volatile private var finishing = false
     private val done = CompletableDeferred<String>()
 
     override fun start() {
@@ -58,11 +60,13 @@ class DeepgramStream(
             // Deepgram closes the socket itself once it has flushed everything after CloseStream.
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                done.complete(finalSnapshot)
+                if (finishing && code == 1000) done.complete(finalSnapshot)
+                else done.completeExceptionally(IOException("Deepgram closed before completion (code $code)"))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                done.complete(finalSnapshot)
+                if (finishing && code == 1000) done.complete(finalSnapshot)
+                else done.completeExceptionally(IOException("Deepgram closed before completion (code $code)"))
             }
         })
     }
@@ -77,18 +81,19 @@ class DeepgramStream(
      * close, and returns the full finalized transcript. Throws if the stream had failed.
      */
     override suspend fun finish(): String {
+        finishing = true
         ws?.send("""{"type":"CloseStream"}""")
         return withTimeoutOrNull(8_000) { done.await() } ?: run {
-            Log.w(TAG, "Timed out waiting for Deepgram to close; using text so far")
+            Log.w(TAG, "Timed out waiting for Deepgram to close; falling back to recorded audio")
             ws?.cancel()
-            finalSnapshot
+            throw IOException("Timed out waiting for transcription completion")
         }
     }
 
     /** Drops the connection immediately, discarding any pending results. */
     override fun cancel() {
-        ws?.cancel()
         done.complete(finalSnapshot)
+        ws?.cancel()
     }
 
     private fun handle(text: String) {

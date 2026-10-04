@@ -1,10 +1,12 @@
 package com.example.smartnotetaker
 
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -85,4 +87,56 @@ class LiveTranscriberContractTest(
         try { withContext(Dispatchers.IO) { s.finish() } } catch (e: Exception) { /* fine */ }
         assertTrue(System.currentTimeMillis() - t0 < 9_000)
     }
+    @Test
+    fun `missing completion times out as failure even with no text`() = runBlocking {
+        server.expectUpgrade()
+        val s = stream()
+        s.start()
+        server.awaitOpen()
+        val error = runCatching { withContext(Dispatchers.IO) { s.finish() } }.exceptionOrNull()
+        assertTrue("$name: unconfirmed silence must not discard the recording", error is java.io.IOException)
+    }
+
+    @Test
+    fun `close before finish is not successful silence`() = runBlocking {
+        server.expectUpgrade()
+        val s = stream()
+        s.start()
+        server.awaitOpen()
+        server.socket.close(1000, "session ended unexpectedly")
+        assertTrue(server.awaitClientClose())
+        val error = runCatching { withContext(Dispatchers.IO) { s.finish() } }.exceptionOrNull()
+        assertTrue("$name: premature close must fall back to the recording", error is java.io.IOException)
+    }
+
+    @Test
+    fun `unresponsive handshake cannot become a successful empty transcript`() = runBlocking {
+        server.server.enqueue(okhttp3.mockwebserver.MockResponse()
+            .setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))
+        val s = stream()
+        s.start()
+        val error = runCatching { withContext(Dispatchers.IO) { s.finish() } }.exceptionOrNull()
+        assertTrue("$name: unconnected stream must fail", error is java.io.IOException)
+        s.cancel()
+    }
+
+    @Test
+    fun `confirmed silent completion remains a valid empty transcript`() = runBlocking {
+        server.expectUpgrade()
+        val s = stream()
+        s.start()
+        server.awaitOpen()
+        if (name == "OpenAI" || name == "Soniox") server.nextText() // session configuration
+        val finishing = async(Dispatchers.IO) { s.finish() }
+        server.nextText() // finish signal
+        when (name) {
+            "Deepgram" -> server.socket.close(1000, "done")
+            "OpenAI" -> server.send("""{"type":"error","error":{"code":"input_audio_buffer_commit_empty","message":"Buffer is empty"}}""")
+            "ElevenLabs" -> server.send("""{"message_type":"insufficient_audio_activity"}""")
+            "AssemblyAI" -> server.send("""{"type":"Termination"}""")
+            "Soniox" -> server.send("""{"finished":true}""")
+        }
+        assertEquals("", finishing.await())
+    }
+
 }

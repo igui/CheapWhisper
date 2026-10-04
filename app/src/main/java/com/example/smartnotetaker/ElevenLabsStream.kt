@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -61,11 +62,11 @@ class ElevenLabsStream(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                done.complete(finalSnapshot)
+                done.completeExceptionally(IOException("ElevenLabs closed before transcription completion (code $code)"))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                done.complete(finalSnapshot)
+                done.completeExceptionally(IOException("ElevenLabs closed before transcription completion (code $code)"))
             }
         })
     }
@@ -95,16 +96,16 @@ class ElevenLabsStream(
             .put("sample_rate", SAMPLE_RATE)
         ws?.send(commit.toString())
         return withTimeoutOrNull(8_000) { done.await() } ?: run {
-            Log.w(TAG, "Timed out waiting for ElevenLabs to flush; using text so far")
+            Log.w(TAG, "Timed out waiting for ElevenLabs to flush; falling back to recorded audio")
             ws?.cancel()
-            finalSnapshot
+            throw IOException("Timed out waiting for transcription completion")
         }
     }
 
     /** Drops the connection immediately, discarding any pending results. */
     override fun cancel() {
-        ws?.cancel()
         done.complete(finalSnapshot)
+        ws?.cancel()
     }
 
     private fun handle(text: String) {
@@ -128,7 +129,7 @@ class ElevenLabsStream(
             }
             // Our closing commit found nothing new to transcribe (the VAD already committed it
             // all, or the user never spoke): the transcript so far is complete.
-            "insufficient_audio_activity", "commit_throttled" -> {
+            "insufficient_audio_activity" -> {
                 if (finishing) flushed() else Log.w(TAG, "$type: $text")
             }
             "session_started", "committed_transcript_with_timestamps",

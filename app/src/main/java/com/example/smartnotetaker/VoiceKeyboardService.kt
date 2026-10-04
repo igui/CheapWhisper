@@ -8,6 +8,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.inputmethodservice.InputMethodService
 import android.os.Handler
 import android.os.Looper
@@ -63,15 +66,65 @@ class VoiceKeyboardService : InputMethodService() {
     private var previewJob: Job? = null
     private var previewText = ""
 
-    // Undo history: full-field snapshots, most recent last.
-    private val undoStack = ArrayDeque<String>()
     private var fieldBeforeDictation = ""
+
+    // Set after a transcription/cleanup failure so the user can retry without re-speaking.
+    // Holds a private copy of the recorded audio (the live note_audio.wav is overwritten by
+    // the next recording) plus enough context to re-run only the stage that failed.
+    private var pendingRetry: PendingDictation? = null
+    private var retryStore: DictationRetryStore? = null
+    private var recordingEditor = ""
+    private var recordingConnection: InputConnection? = null
+    private val retryConnections = mutableMapOf<String, InputConnection>()
+    private val automaticAttempts = mutableSetOf<String>()
+    private var discardCanceledRecording = false
+    private var confirmationId: String? = null
+    private var confirmationConnection: InputConnection? = null
+    private var previewConnection: InputConnection? = null
+    private var networkRegistered = false
+    private var restoreJob: Job? = null
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) { Handler(Looper.getMainLooper()).post { maybeRetryOnline() } }
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) Handler(Looper.getMainLooper()).post { maybeRetryOnline() }
+        }
+    }
+    private fun networkAvailable(): Boolean {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return false
+        return manager.getNetworkCapabilities(manager.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+    }
+    private fun editorIdentity(): String = currentInputEditorInfo?.let { "${it.packageName}:${it.fieldId}:${it.fieldName}:${it.inputType}" }.orEmpty()
+    private fun restoreRetry() {
+        if (!isUserUnlocked() || processing || recordMode != null) return
+        if (restoreJob?.isActive == true) return
+        val editor = editorIdentity(); val text = readFieldText()
+        restoreJob = serviceScope.launch {
+            try {
+                val saved = withContext(Dispatchers.IO) {
+                    val store = retryStore ?: DictationRetryStore(this@VoiceKeyboardService).also { retryStore = it }
+                    store.forEditor(editor, text)
+                }
+                if (!processing && recordMode == null && editorIdentity() == editor && readFieldText() == text) { pendingRetry = saved; finishUi(); maybeRetryOnline() }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { setStatus("Saved recording unavailable", Color.RED) }
+        }
+    }
+    private fun maybeRetryOnline() {
+        val retry = pendingRetry ?: return
+        if (retry.waitingForNetwork && !processing && recordMode == null && isInputViewShown &&
+            isUserUnlocked() && networkAvailable() && retryConnections[retry.id] === currentInputConnection &&
+            currentInputConnection != null && retry.matches(editorIdentity(), readFieldText()) && retry.id !in automaticAttempts) {
+            automaticAttempts.add(retry.id)
+            retry()
+        }
+    }
 
     // View refs kept so state can be refreshed outside onCreateInputView.
     private var micButton: ImageButton? = null
     private var modifyButton: ImageButton? = null
-    private var undoButton: ImageButton? = null
+    private var deleteButton: ImageButton? = null
     private var cancelButton: ImageButton? = null
+    private var retryButton: ImageButton? = null
     private var tvStatus: TextView? = null
     private var tvTranscript: TextView? = null
     private var btnCost: TextView? = null
@@ -94,24 +147,28 @@ class VoiceKeyboardService : InputMethodService() {
         override fun onReceive(context: Context?, intent: Intent?) {
             refreshConfigSummary()
             updateButtonStates()
+            restoreRetry()
         }
     }
 
-    /** Enables/greys Modify (needs field text) and Undo (needs history); disables all while busy. */
+    /** Enables/greys Modify (needs field text); disables everything while busy. */
     private fun updateButtonStates() {
         fun set(b: ImageButton?, enabled: Boolean) {
             b?.let { it.isEnabled = enabled; it.alpha = if (enabled) 1f else 0.4f }
         }
         if (!isUserUnlocked()) {
-            set(micButton, false); set(modifyButton, false); set(undoButton, false)
+            set(micButton, false); set(modifyButton, false); set(deleteButton, false)
             cancelButton?.visibility = View.GONE
+            retryButton?.visibility = View.GONE
             return
         }
         // The actively-held record button must stay enabled to receive its release event.
         set(micButton, (recordMode == null && !processing) || recordMode == MODE_WRITE)
         set(modifyButton, (recordMode == null && !processing && readFieldText().isNotBlank()) || recordMode == MODE_MODIFY)
-        set(undoButton, recordMode == null && !processing && undoStack.isNotEmpty())
+        set(deleteButton, recordMode == null && !processing)
         cancelButton?.visibility = if (processing) View.VISIBLE else View.GONE
+        // Retry replaces Cancel in the same corner; only one shows at a time.
+        retryButton?.visibility = if (!processing && recordMode == null && pendingRetry != null) View.VISIBLE else View.GONE
     }
 
     private fun setStatus(text: String, color: Int = textColorPrimary) {
@@ -135,10 +192,12 @@ class VoiceKeyboardService : InputMethodService() {
         micHandler.removeCallbacks(micLevelRunnable)
         micLevelView?.apply { scaleX = 1f; scaleY = 1f }
         micLevelView = null
-        setStatus("Hold a button to speak")
+        if (pendingRetry != null) setStatus(if (pendingRetry?.waitingForNetwork == true) "Recording saved — waiting for network, or tap Retry" else "Recording saved — tap Retry", Color.RED)
+        else setStatus("Hold a button to speak")
         processing = false
         updateButtonStates()
         serviceScope.launch { aiProcessor.releaseLocalModel() }
+        maybeRetryOnline()
     }
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
@@ -146,6 +205,7 @@ class VoiceKeyboardService : InputMethodService() {
         if (!restarting) hideTranscript()
         refreshConfigSummary()  // settings may have changed since the keyboard was last shown
         updateButtonStates()
+        restoreRetry()
     }
 
     /** Lower-right summary: "<transcription model> · <language>" / "<cleanup model>". */
@@ -168,15 +228,16 @@ class VoiceKeyboardService : InputMethodService() {
     }
 
     /**
-     * The field lost focus or the keyboard was hidden: whatever is running (a recording, a
-     * transcription, a cleanup) no longer has a place to land, so drop it.
+     * Stop editor-bound work on focus loss; accepted recordings remain saved for retry.
      */
     override fun onFinishInputView(finishingInput: Boolean) {
+        stopDeleting()
         cancelCurrent(silent = true)
         super.onFinishInputView(finishingInput)
     }
 
     override fun onFinishInput() {
+        stopDeleting()
         cancelCurrent(silent = true)
         super.onFinishInput()
     }
@@ -187,6 +248,12 @@ class VoiceKeyboardService : InputMethodService() {
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
         updateButtonStates()  // re-evaluate Modify as the field's text changes
+        if (!processing && recordMode == null) {
+            if (oldSelStart != newSelStart || oldSelEnd != newSelEnd || pendingRetry?.matches(editorIdentity(), readFieldText()) == false) {
+                retryConnections.clear(); confirmationId = null; confirmationConnection = null
+            }
+            restoreRetry()
+        }
     }
 
     // Live mic-level: scales whichever record button is active while capturing.
@@ -219,37 +286,29 @@ class VoiceKeyboardService : InputMethodService() {
 
     /** Removes any underlined preview text from the field without committing it. */
     private fun discardPreview() {
-        if (previewText.isNotEmpty()) currentInputConnection?.commitText("", 1)
+        if (previewText.isNotEmpty()) previewConnection?.commitText("", 1)
         previewText = ""
+        previewConnection = null
     }
 
     // Hold-to-repeat backspace, like a standard Android keyboard: starts deleting
     // characters, then switches to whole words once it has been held a while.
     private val deleteHandler = Handler(Looper.getMainLooper())
     private var deleteRepeatCount = 0
+    private var deleteConnection: InputConnection? = null
+    private var suppressDeleteClick = false
     private val deleteRunnable = object : Runnable {
         override fun run() {
-            val ic = currentInputConnection ?: return
+            val connection = deleteConnection ?: return
+            if (currentInputConnection !== connection || processing || recordMode != null) { stopDeleting(); return }
             deleteRepeatCount++
-            // First ~20 repeats delete characters; after that, accelerate to words.
-            if (deleteRepeatCount < 20) {
-                ic.deleteSurroundingText(1, 0)
-                deleteHandler.postDelayed(this, (120L - deleteRepeatCount * 4L).coerceAtLeast(40L))
-            } else {
-                deleteLastWord(ic)
-                deleteHandler.postDelayed(this, 90L)
-            }
+            if (!EditorBackspace.delete(connection, wholeWord = deleteRepeatCount >= 20)) { stopDeleting(); return }
+            deleteHandler.postDelayed(this, if (deleteRepeatCount >= 20) 90L else (120L - deleteRepeatCount * 4L).coerceAtLeast(40L))
         }
     }
-
-    /** Deletes the run of trailing whitespace plus the word before the cursor. */
-    private fun deleteLastWord(ic: InputConnection) {
-        val before = ic.getTextBeforeCursor(64, 0) ?: return
-        if (before.isEmpty()) return
-        var i = before.length
-        while (i > 0 && before[i - 1].isWhitespace()) i--
-        while (i > 0 && !before[i - 1].isWhitespace()) i--
-        ic.deleteSurroundingText((before.length - i).coerceAtLeast(1), 0)
+    private fun stopDeleting() {
+        deleteHandler.removeCallbacks(deleteRunnable)
+        deleteConnection = null
     }
 
     // ---------------------------------------------------------------- live text
@@ -257,7 +316,10 @@ class VoiceKeyboardService : InputMethodService() {
     /** Shows the running transcript where it belongs for [mode]. */
     private fun renderLiveText(mode: String, text: String) {
         previewText = text
-        if (mode == MODE_WRITE) currentInputConnection?.setComposingText(text, 1)
+        if (mode == MODE_WRITE) {
+            previewConnection = currentInputConnection
+            previewConnection?.setComposingText(text, 1)
+        }
         else showTranscript(if (text.isEmpty()) "Listening…" else text)
     }
 
@@ -353,16 +415,30 @@ class VoiceKeyboardService : InputMethodService() {
             return false
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Please open CheapWhisper app and grant microphone permissions", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Open CheapWhisper Settings and tap Grant for microphone access", Toast.LENGTH_LONG).show()
             return false
         }
         return true
     }
 
+    /** Discards any saved retry state and its audio copy. */
+    private suspend fun clearPendingRetry(row: PendingDictation) {
+        retryConnections.remove(row.id); automaticAttempts.remove(row.id)
+        val editor = editorIdentity(); val text = readFieldText()
+        withContext(NonCancellable) {
+            pendingRetry = withContext(Dispatchers.IO) { retryStore?.remove(row); retryStore?.forEditor(editor, text) }
+        }
+    }
+
     private fun startRec(mode: String, activeButton: View) {
+        restoreJob?.cancel()
+        retryConnections.clear(); confirmationId = null; confirmationConnection = null
+        stopDeleting()
         recordMode = mode
         previewText = ""
         fieldBeforeDictation = readFieldText()
+        recordingEditor = editorIdentity()
+        recordingConnection = currentInputConnection
         setStatus(if (mode == MODE_WRITE) "Recording... release to stop" else "Listening for edit... release to stop", Color.RED)
         if (mode == MODE_MODIFY) showTranscript("Listening…") else hideTranscript()
         micLevelView = activeButton
@@ -371,8 +447,10 @@ class VoiceKeyboardService : InputMethodService() {
         val choice = ss.getModelChoice()
         val keys = ss.getApiKeys()
         val language = ss.getTranscribeLanguage()
-        val stream = createLiveTranscriber(choice, keys, language) { finalText, interim ->
-            if (liveStream == null) return@createLiveTranscriber  // session already torn down
+        val target = currentInputConnection
+        var stream: LiveTranscriber? = null
+        stream = createLiveTranscriber(choice, keys, language) { finalText, interim ->
+            if (liveStream !== stream || currentInputConnection !== target || recordMode != mode) return@createLiveTranscriber
             renderLiveText(mode, listOf(finalText, interim).filter { it.isNotEmpty() }.joinToString(" "))
         }
         when {
@@ -405,10 +483,134 @@ class VoiceKeyboardService : InputMethodService() {
             finishUi()
             if (!silent) Toast.makeText(this, "Cancelled", Toast.LENGTH_SHORT).show()
         } else if (processing) {
+            if (!silent) discardCanceledRecording = true
             imeJob?.cancel()
             liveStream?.cancel()
             aiProcessor.cancelInFlight()
             if (!silent) Toast.makeText(this, "Cancelled", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * The post-transcription pipeline shared by [stopAndProcess] and [retry]: run cleanup
+     * (write) or the LLM edit (modify), commit to the field, and record undo snapshots.
+     * [fieldBefore] is the field content before the dictation, used as the modify base and
+     * the first undo step.
+     */
+    private suspend fun applyResult(
+        mode: String, rawText: String, existingText: String, fieldBefore: String,
+        expectedEditor: String, llmChoice: String, apiKeys: ApiKeys, cleanupPrompt: String,
+    ) {
+        val destination = currentInputConnection ?: throw IllegalStateException("Original editor is unavailable. Recording saved.")
+        check(editorIdentity() == expectedEditor) { "Return to the original field to retry." }
+        if (mode == MODE_MODIFY) check(readFieldText() == existingText) { "Field changed. Restore the original text before retrying this edit." }
+        val llmFile: File? = if (llmChoice != "OpenAI") {
+            setStatus("Loading LLM (Local)...", Color.GRAY)
+            modelDownloader.downloadLlmModel(llmChoice) { } ?: throw Exception("Failed to load local LLM")
+        } else null
+
+        currentCoroutineContext().ensureActive()
+        check(currentInputConnection === destination && editorIdentity() == expectedEditor) { "Editor changed. Recording saved." }
+        if (mode == MODE_WRITE) {
+            setStatus("Cleaning up Text...", Color.GRAY)
+            // Show the raw words while the LLM works, in case they were not previewed.
+            if (rawText.isNotBlank()) renderLiveText(mode, rawText.trim())
+            val cleanText = (if (llmChoice == "OpenAI")
+                aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker, cleanupPrompt)
+            else aiProcessor.cleanTextLocal(rawText, llmFile!!, cleanupPrompt)).trim()
+            // commitText replaces the composing (preview) text, if any.
+            currentCoroutineContext().ensureActive()
+            check(currentInputConnection === destination && editorIdentity() == expectedEditor) { "Editor changed. Recording saved." }
+            check(destination.commitText("$cleanText ", 1)) { "Editor rejected text. Recording saved." }
+            previewText = ""
+            previewConnection = null
+        } else {
+            showTranscript(rawText.trim().ifEmpty { "(nothing heard)" })
+            setStatus("Applying edit...", Color.GRAY)
+            val newText = if (llmChoice == "OpenAI")
+                aiProcessor.modifyText(existingText, rawText, apiKeys.openai, usageTracker)
+            else aiProcessor.modifyTextLocal(existingText, rawText, llmFile!!)
+            currentCoroutineContext().ensureActive()
+            check(currentInputConnection === destination && editorIdentity() == expectedEditor && readFieldText() == existingText) { "Field changed. Recording saved." }
+            replaceFieldText(newText.trim())
+        }
+    }
+
+    /**
+     * Re-runs a failed dictation from the saved audio. If transcription had already
+     * succeeded, only the cleanup/edit stage is repeated (no re-transcription, no double
+     * transcription billing). Retry requires the original unchanged editor.
+     */
+    private fun retry() {
+        val pr = pendingRetry ?: return
+        if (processing || recordMode != null || !isUserUnlocked()) return
+        if (!pr.matches(editorIdentity(), readFieldText())) {
+            Toast.makeText(this, "Return to the original field and text to retry this recording.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val connection = currentInputConnection ?: return
+        if (retryConnections[pr.id] !== connection) {
+            if (confirmationId != pr.id || confirmationConnection !== connection) {
+                confirmationId = pr.id; confirmationConnection = connection
+                Toast.makeText(this, "Saved in an earlier editor session. Tap Retry again to apply it to this field.", Toast.LENGTH_LONG).show()
+                return
+            }
+            retryConnections[pr.id] = connection
+        }
+        confirmationId = null; confirmationConnection = null
+        restoreJob?.cancel()
+        discardCanceledRecording = false
+        processing = true
+        setStatus("Retrying…", Color.GRAY)
+        updateButtonStates()
+
+        val ss = SecureStorage(this)
+        val apiKeys = ss.getApiKeys().copy(openrouterModel = pr.openRouterModel)
+        val language = pr.language
+        val llmChoice = pr.llm
+        val modelChoice = pr.provider
+        val cleanupPrompt = pr.cleanupPrompt
+
+        imeJob = serviceScope.launch {
+            try {
+                val rawText = pr.rawText ?: aiProcessor.transcribe(
+                    choice = modelChoice, language = language, audioFile = pr.wav,
+                    wavRecorder = wavRecorder, modelDownloader = modelDownloader,
+                    keys = apiKeys, usageTracker = usageTracker,
+                    onStatus = { setStatus(it, Color.GRAY) }, onProgress = { },
+                ).also { text ->
+                    val updated = pr.copy(rawText = text, waitingForNetwork = false)
+                    pendingRetry = updated
+                    withContext(Dispatchers.IO) { runCatching { retryStore?.save(updated) } }
+                }
+                applyResult(
+                    pr.mode, rawText,
+                    if (pr.mode == MODE_MODIFY) pr.fieldBefore else "",
+                    pr.fieldBefore, pr.editor, llmChoice, apiKeys, cleanupPrompt,
+                )
+                btnCost?.let { c -> tvCostBreakdown?.let { b -> refreshCostViews(c, b) } }
+                clearPendingRetry(pr)
+            } catch (e: CancellationException) {
+                discardPreview()
+                if (pr.mode == MODE_MODIFY) hideTranscript()
+                if (discardCanceledRecording) clearPendingRetry(pr)
+                else withContext(NonCancellable) {
+                    val saved = (pendingRetry ?: pr).copy(waitingForNetwork = false)
+                    withContext(Dispatchers.IO) { runCatching { retryStore?.save(saved) } }
+                    pendingRetry = saved
+                }
+                throw e
+            } catch (e: Exception) {
+                discardPreview()
+                if (pr.mode == MODE_MODIFY) hideTranscript()
+                val saved = (pendingRetry ?: pr).copy(waitingForNetwork = !networkAvailable())
+                pendingRetry = saved
+                withContext(Dispatchers.IO) { runCatching { retryStore?.save(saved) } }
+                if (isActive) Toast.makeText(this@VoiceKeyboardService, "Retry failed; recording kept: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                imeJob = null
+                finishUi()
+            }
         }
     }
 
@@ -424,6 +626,7 @@ class VoiceKeyboardService : InputMethodService() {
         micLevelView?.apply { scaleX = 1f; scaleY = 1f }
         micLevelView = null
         setStatus("Processing...", Color.GRAY)
+        discardCanceledRecording = false
         processing = true
         updateButtonStates()
 
@@ -446,9 +649,28 @@ class VoiceKeyboardService : InputMethodService() {
             return
         }
         val audioSeconds = (file.length() - 44) / 32000.0
+        val originalField = fieldBeforeDictation
+        val originalEditor = recordingEditor
+        val originalConnection = recordingConnection
 
         imeJob = serviceScope.launch {
+            var savedRecording: PendingDictation? = null
             try {
+                savedRecording = try {
+                    withContext(NonCancellable + Dispatchers.IO) {
+                        val store = retryStore ?: DictationRetryStore(this@VoiceKeyboardService).also { retryStore = it }
+                        store.enqueue(file, mode, originalField, originalEditor, modelChoice, transcribeLanguage, apiKeys.openrouterModel, llmChoice, cleanupPrompt)
+                    }
+                } catch (_: Exception) {
+                    Toast.makeText(this@VoiceKeyboardService, "Retry storage unavailable; processing this recording without a saved copy.", Toast.LENGTH_LONG).show()
+                    null
+                }
+                if (savedRecording != null) {
+                    pendingRetry = savedRecording
+                    if (originalConnection != null) retryConnections[savedRecording!!.id] = originalConnection
+                }
+                currentCoroutineContext().ensureActive()
+                check(currentInputConnection === originalConnection) { "Editor changed. Recording saved." }
                 suspend fun transcribeFile(): String = aiProcessor.transcribe(
                     choice = modelChoice,
                     language = transcribeLanguage,
@@ -479,55 +701,32 @@ class VoiceKeyboardService : InputMethodService() {
                     }
                 } else transcribeFile()
                 liveStream = null
-
-                val llmFile: File? = if (llmChoice != "OpenAI") {
-                    setStatus("Loading LLM (Local)...", Color.GRAY)
-                    modelDownloader.downloadLlmModel(llmChoice) { } ?: throw Exception("Failed to load local LLM")
-                } else null
-
-                if (mode == MODE_WRITE) {
-                    setStatus("Cleaning up Text...", Color.GRAY)
-                    // Show the raw words while the LLM works, in case they were not previewed.
-                    if (rawText.isNotBlank()) renderLiveText(mode, rawText.trim())
-                    val cleanText = (if (llmChoice == "OpenAI")
-                        aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker, cleanupPrompt)
-                    else aiProcessor.cleanTextLocal(rawText, llmFile!!, cleanupPrompt)).trim()
-                    // commitText replaces the composing (preview) text, if any.
-                    currentInputConnection?.commitText("$cleanText ", 1)
-                    previewText = ""
-                    // Undo twice: first back to the raw transcript, then to before the dictation.
-                    undoStack.addLast(fieldBeforeDictation)
-                    val afterCommit = readFieldText()
-                    val rawTrimmed = rawText.trim()
-                    if (rawTrimmed.isNotEmpty() && rawTrimmed != cleanText) {
-                        val i = afterCommit.lastIndexOf(cleanText)
-                        if (i >= 0) undoStack.addLast(afterCommit.substring(0, i) + rawTrimmed + afterCommit.substring(i + cleanText.length))
-                    }
-                } else {
-                    showTranscript(rawText.trim().ifEmpty { "(nothing heard)" })
-                    setStatus("Applying edit...", Color.GRAY)
-                    val newText = if (llmChoice == "OpenAI")
-                        aiProcessor.modifyText(existingText, rawText, apiKeys.openai, usageTracker)
-                    else aiProcessor.modifyTextLocal(existingText, rawText, llmFile!!)
-                    undoStack.addLast(existingText)
-                    replaceFieldText(newText.trim())
+                savedRecording = savedRecording?.copy(rawText = rawText)
+                savedRecording?.let { saved ->
+                    pendingRetry = saved
+                    withContext(Dispatchers.IO) { runCatching { retryStore?.save(saved) } }
                 }
+
+                applyResult(mode, rawText, existingText, originalField, originalEditor, llmChoice, apiKeys, cleanupPrompt)
                 btnCost?.let { c -> tvCostBreakdown?.let { b -> refreshCostViews(c, b) } }
+                savedRecording?.let { clearPendingRetry(it) }
             } catch (e: CancellationException) {
                 abortLiveStream()
                 discardPreview()  // user cancelled: drop the underlined preview too
                 if (mode == MODE_MODIFY) hideTranscript()
+                if (discardCanceledRecording) savedRecording?.let { clearPendingRetry(it) }
                 throw e
             } catch (e: Exception) {
+                abortLiveStream()
                 if (isActive) {
-                    // Keep whatever the live preview already captured rather than losing it.
-                    if (mode == MODE_WRITE && previewText.isNotEmpty()) {
-                        currentInputConnection?.commitText("$previewText ", 1)
-                        previewText = ""
-                        Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message} (kept live preview text)", Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    discardPreview()                       // drop the underlined partial text
+                    if (mode == MODE_MODIFY) hideTranscript()
+                    savedRecording?.let { record ->
+                        val saved = record.copy(waitingForNetwork = !networkAvailable())
+                        pendingRetry = saved
+                        withContext(Dispatchers.IO) { runCatching { retryStore?.save(saved) } }
                     }
+                    Toast.makeText(this@VoiceKeyboardService, if (savedRecording != null) "Recording saved: ${e.message}" else "Could not save recording: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             } finally {
                 liveStream = null
@@ -549,18 +748,21 @@ class VoiceKeyboardService : InputMethodService() {
         modelDownloader = LocalModelDownloader(this)
         usageTracker = UsageTracker(this)
         registerReceiver(unlockReceiver, IntentFilter(Intent.ACTION_USER_UNLOCKED))
+        runCatching { getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(networkCallback); networkRegistered = true }
+        restoreRetry()
     }
 
     /** Updates the bottom-right total and the expanded per-provider breakdown. */
     private fun refreshCostViews(costButton: TextView, breakdown: TextView) {
-        val total = usageTracker.totalMicros()
-        costButton.text = UsageTracker.formatUsd(total)
-        val rows = usageTracker.byProvider().filter { it.second > 0L }  // omit no-usage providers
-        val lines = if (rows.isEmpty()) "No usage yet."
-        else rows.joinToString("\n") { (provider, micros) ->
-            "$provider (${CostEstimator.formatPerHour(provider)}): ${UsageTracker.formatUsd(micros)}"
+        serviceScope.launch {
+            val values = withContext(Dispatchers.IO) { usageTracker.totalMicros() to usageTracker.byProvider().filter { it.second > 0L } }
+            costButton.text = UsageTracker.formatUsd(values.first)
+            val lines = if (values.second.isEmpty()) "No usage yet." else values.second.joinToString("\n") { (provider, micros) ->
+                if (provider == PROVIDER_OPENROUTER) "$provider: ${UsageTracker.formatUsd(micros)}"
+                else "$provider (${CostEstimator.formatPerHour(provider)}): ${UsageTracker.formatUsd(micros)}"
+            }
+            breakdown.text = "$lines\n—\nTotal: ${UsageTracker.formatUsd(values.first)}"
         }
-        breakdown.text = "$lines\n—\nTotal: ${UsageTracker.formatUsd(total)}"
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -572,8 +774,8 @@ class VoiceKeyboardService : InputMethodService() {
         val btnMic = layout.findViewById<ImageButton>(R.id.btn_mic)
         val btnDelete = layout.findViewById<ImageButton>(R.id.btn_delete)
         val btnModify = layout.findViewById<ImageButton>(R.id.btn_modify)
-        val btnUndo = layout.findViewById<ImageButton>(R.id.btn_undo)
         val btnCancel = layout.findViewById<ImageButton>(R.id.btn_cancel)
+        val btnRetry = layout.findViewById<ImageButton>(R.id.btn_retry)
         val status = layout.findViewById<TextView>(R.id.tv_status)
         val transcript = layout.findViewById<TextView>(R.id.tv_transcript)
         val cost = layout.findViewById<TextView>(R.id.btn_cost)
@@ -583,8 +785,9 @@ class VoiceKeyboardService : InputMethodService() {
 
         micButton = btnMic
         modifyButton = btnModify
-        undoButton = btnUndo
+        deleteButton = btnDelete
         cancelButton = btnCancel
+        retryButton = btnRetry
         tvStatus = status
         tvTranscript = transcript
         btnCost = cost
@@ -620,20 +823,30 @@ class VoiceKeyboardService : InputMethodService() {
             requestHideSelf(0)
         }
 
-        btnDelete.setOnTouchListener { v, event ->
+        btnDelete.setOnClickListener {
+            if (!suppressDeleteClick && !processing && recordMode == null) currentInputConnection?.let { EditorBackspace.delete(it) }
+        }
+        btnDelete.setOnTouchListener { view, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    deleteRepeatCount = 0
-                    currentInputConnection?.deleteSurroundingText(1, 0)  // immediate single delete on tap
-                    deleteHandler.postDelayed(deleteRunnable, 400L)       // begin repeating after a hold
+                    stopDeleting()
+                    if (!processing && recordMode == null && isUserUnlocked()) {
+                        deleteRepeatCount = 0
+                        deleteConnection = currentInputConnection
+                        deleteConnection?.let { EditorBackspace.delete(it) }
+                        deleteHandler.postDelayed(deleteRunnable, 400L)
+                    }
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    deleteHandler.removeCallbacks(deleteRunnable)
-                    if (event.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                    stopDeleting()
+                    if (event.actionMasked == MotionEvent.ACTION_UP) {
+                        suppressDeleteClick = true
+                        try { view.performClick() } finally { suppressDeleteClick = false }
+                    }
                     true
                 }
-                else -> false
+                else -> true
             }
         }
 
@@ -662,15 +875,19 @@ class VoiceKeyboardService : InputMethodService() {
         btnMic.setOnTouchListener(recordTouch(MODE_WRITE))
         btnModify.setOnTouchListener(recordTouch(MODE_MODIFY))
 
-        btnUndo.setOnClickListener {
-            if (recordMode != null || processing) return@setOnClickListener
-            if (undoStack.isNotEmpty()) replaceFieldText(undoStack.removeLast())
-            updateButtonStates()
-        }
-
         // Cancel the in-flight request via the red X or by tapping the status line.
         btnCancel.setOnClickListener { cancelCurrent() }
         status.setOnClickListener { if (processing) cancelCurrent() }
+        btnRetry.setOnClickListener { retry() }
+        btnRetry.contentDescription = "Retry saved recording; hold to discard"
+        btnRetry.setOnLongClickListener {
+            val row = pendingRetry
+            if (row != null && !processing) serviceScope.launch {
+                clearPendingRetry(row); finishUi()
+                Toast.makeText(this@VoiceKeyboardService, "Saved recording discarded", Toast.LENGTH_SHORT).show()
+            }
+            true
+        }
 
         updateButtonStates()
         return layout
@@ -678,6 +895,7 @@ class VoiceKeyboardService : InputMethodService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (networkRegistered) runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(networkCallback) }
         try { unregisterReceiver(unlockReceiver) } catch (e: IllegalArgumentException) { }
         imeJob?.cancel()
         previewJob?.cancel()

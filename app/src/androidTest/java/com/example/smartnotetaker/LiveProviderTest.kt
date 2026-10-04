@@ -234,18 +234,18 @@ class LiveProviderTest {
     // ----- d. Cancel ------------------------------------------------------------------------
 
     @Test fun cancel_deepgram() = runCancelTest(PROVIDER_DEEPGRAM, "DEEPGRAM_API_KEY") { k ->
-        DeepgramStream(client, k, "en") { _, _ -> }
+        DeepgramStream(client, k, "en", onTranscript = { _, _ -> })
     }
 
     @Test fun cancel_openai() = runCancelTest(PROVIDER_OPENAI, "OPENAI_API_KEY") { k ->
-        OpenAiStream(client, k, "en") { _, _ -> }
+        OpenAiStream(client, k, "en", onTranscript = { _, _ -> })
     }
 
     @Test fun cancel_elevenlabs() = runCancelTest(PROVIDER_ELEVENLABS, "ELEVENLABS_API_KEY") { k ->
-        ElevenLabsStream(client, k, "en") { _, _ -> }
+        ElevenLabsStream(client, k, "en", onTranscript = { _, _ -> })
     }
 
     @Test fun cancel_assemblyai() = runCancelTest(PROVIDER_ASSEMBLYAI, "ASSEMBLYAI_API_KEY") { k ->
-        AssemblyAiStream(client, k, "en") { _, _ -> }
+        AssemblyAiStream(client, k, "en", onTranscript = { _, _ -> })
     }
 }

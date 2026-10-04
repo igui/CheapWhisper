@@ -136,25 +136,25 @@ class SonioxStreamTest {
     }
 
     @Test
-    fun `finish returns the finals when the server closes without a finished message`() = runBlocking {
+    fun `finish throws when the server closes without a finished message`() = runBlocking {
         val (s, _) = open()
         server.send(tokens("Hi" to true))
         recorder.await(1)
-        val finishing = async(Dispatchers.IO) { s.finish() }
+        val finishing = async(Dispatchers.IO) { runCatching { s.finish() } }
         server.nextText()
         server.socket.close(1000, "done")
-        assertEquals("Hi", finishing.await())
+        assertTrue(finishing.await().exceptionOrNull() is java.io.IOException)
     }
 
     @Test
-    fun `finish times out gracefully and returns the text so far`() = runBlocking {
+    fun `finish throws on timeout even when partial finals exist`() = runBlocking {
         val (s, _) = open()
         server.send(tokens("partial" to true, " answer" to true))
         recorder.await(1)
         val t0 = System.currentTimeMillis()
-        val text = withContext(Dispatchers.IO) { s.finish() }  // server never finishes
+        val error = runCatching { withContext(Dispatchers.IO) { s.finish() } }.exceptionOrNull()
         val elapsed = System.currentTimeMillis() - t0
-        assertEquals("partial answer", text)
+        assertTrue("Incomplete streaming must fall back to the WAV", error is java.io.IOException)
         assertTrue("timed out after ${elapsed}ms", elapsed in 7_000..12_000)
     }
 
