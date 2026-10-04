@@ -63,15 +63,24 @@ class VoiceKeyboardService : InputMethodService() {
     private var previewJob: Job? = null
     private var previewText = ""
 
-    // Undo history: full-field snapshots, most recent last.
-    private val undoStack = ArrayDeque<String>()
     private var fieldBeforeDictation = ""
+
+    // Set after a transcription/cleanup failure so the user can retry without re-speaking.
+    // Holds a private copy of the recorded audio (the live note_audio.wav is overwritten by
+    // the next recording) plus enough context to re-run only the stage that failed.
+    private data class PendingRetry(
+        val mode: String,
+        val wav: File,
+        val rawText: String?,      // non-null once transcription has already succeeded
+        val fieldBefore: String,   // field snapshot before the dictation (for undo / modify base)
+    )
+    private var pendingRetry: PendingRetry? = null
 
     // View refs kept so state can be refreshed outside onCreateInputView.
     private var micButton: ImageButton? = null
     private var modifyButton: ImageButton? = null
-    private var undoButton: ImageButton? = null
     private var cancelButton: ImageButton? = null
+    private var retryButton: ImageButton? = null
     private var tvStatus: TextView? = null
     private var tvTranscript: TextView? = null
     private var btnCost: TextView? = null
@@ -97,21 +106,23 @@ class VoiceKeyboardService : InputMethodService() {
         }
     }
 
-    /** Enables/greys Modify (needs field text) and Undo (needs history); disables all while busy. */
+    /** Enables/greys Modify (needs field text); disables everything while busy. */
     private fun updateButtonStates() {
         fun set(b: ImageButton?, enabled: Boolean) {
             b?.let { it.isEnabled = enabled; it.alpha = if (enabled) 1f else 0.4f }
         }
         if (!isUserUnlocked()) {
-            set(micButton, false); set(modifyButton, false); set(undoButton, false)
+            set(micButton, false); set(modifyButton, false)
             cancelButton?.visibility = View.GONE
+            retryButton?.visibility = View.GONE
             return
         }
         // The actively-held record button must stay enabled to receive its release event.
         set(micButton, (recordMode == null && !processing) || recordMode == MODE_WRITE)
         set(modifyButton, (recordMode == null && !processing && readFieldText().isNotBlank()) || recordMode == MODE_MODIFY)
-        set(undoButton, recordMode == null && !processing && undoStack.isNotEmpty())
         cancelButton?.visibility = if (processing) View.VISIBLE else View.GONE
+        // Retry replaces Cancel in the same corner; only one shows at a time.
+        retryButton?.visibility = if (!processing && recordMode == null && pendingRetry != null) View.VISIBLE else View.GONE
     }
 
     private fun setStatus(text: String, color: Int = textColorPrimary) {
@@ -135,7 +146,8 @@ class VoiceKeyboardService : InputMethodService() {
         micHandler.removeCallbacks(micLevelRunnable)
         micLevelView?.apply { scaleX = 1f; scaleY = 1f }
         micLevelView = null
-        setStatus("Hold a button to speak")
+        if (pendingRetry != null) setStatus("Failed — tap Retry to try again", Color.RED)
+        else setStatus("Hold a button to speak")
         processing = false
         updateButtonStates()
         serviceScope.launch { aiProcessor.releaseLocalModel() }
@@ -359,8 +371,15 @@ class VoiceKeyboardService : InputMethodService() {
         return true
     }
 
+    /** Discards any saved retry state and its audio copy. */
+    private fun clearPendingRetry() {
+        pendingRetry?.wav?.let { runCatching { it.delete() } }
+        pendingRetry = null
+    }
+
     private fun startRec(mode: String, activeButton: View) {
         recordMode = mode
+        clearPendingRetry()  // a fresh recording supersedes any earlier failure
         previewText = ""
         fieldBeforeDictation = readFieldText()
         setStatus(if (mode == MODE_WRITE) "Recording... release to stop" else "Listening for edit... release to stop", Color.RED)
@@ -413,6 +432,86 @@ class VoiceKeyboardService : InputMethodService() {
     }
 
     /**
+     * The post-transcription pipeline shared by [stopAndProcess] and [retry]: run cleanup
+     * (write) or the LLM edit (modify), commit to the field, and record undo snapshots.
+     * [fieldBefore] is the field content before the dictation, used as the modify base and
+     * the first undo step.
+     */
+    private suspend fun applyResult(
+        mode: String, rawText: String, existingText: String, fieldBefore: String,
+        llmChoice: String, apiKeys: ApiKeys, cleanupPrompt: String,
+    ) {
+        val llmFile: File? = if (llmChoice != "OpenAI") {
+            setStatus("Loading LLM (Local)...", Color.GRAY)
+            modelDownloader.downloadLlmModel(llmChoice) { } ?: throw Exception("Failed to load local LLM")
+        } else null
+
+        if (mode == MODE_WRITE) {
+            setStatus("Cleaning up Text...", Color.GRAY)
+            // Show the raw words while the LLM works, in case they were not previewed.
+            if (rawText.isNotBlank()) renderLiveText(mode, rawText.trim())
+            val cleanText = (if (llmChoice == "OpenAI")
+                aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker, cleanupPrompt)
+            else aiProcessor.cleanTextLocal(rawText, llmFile!!, cleanupPrompt)).trim()
+            // commitText replaces the composing (preview) text, if any.
+            currentInputConnection?.commitText("$cleanText ", 1)
+            previewText = ""
+        } else {
+            showTranscript(rawText.trim().ifEmpty { "(nothing heard)" })
+            setStatus("Applying edit...", Color.GRAY)
+            val newText = if (llmChoice == "OpenAI")
+                aiProcessor.modifyText(existingText, rawText, apiKeys.openai, usageTracker)
+            else aiProcessor.modifyTextLocal(existingText, rawText, llmFile!!)
+            replaceFieldText(newText.trim())
+        }
+    }
+
+    /**
+     * Re-runs a failed dictation from the saved audio. If transcription had already
+     * succeeded, only the cleanup/edit stage is repeated (no re-transcription, no double
+     * transcription billing). The result lands in whatever field is focused now.
+     */
+    private fun retry() {
+        val pr = pendingRetry ?: return
+        if (processing || recordMode != null || !isUserUnlocked()) return
+        processing = true
+        setStatus("Retrying…", Color.GRAY)
+        updateButtonStates()
+
+        val ss = SecureStorage(this)
+        val apiKeys = ss.getApiKeys()
+        val language = ss.getTranscribeLanguage()
+        val llmChoice = ss.getLlmChoice()
+        val modelChoice = ss.getModelChoice()
+        val cleanupPrompt = ss.getCleanupPrompt()
+
+        imeJob = serviceScope.launch {
+            try {
+                val rawText = pr.rawText ?: aiProcessor.transcribe(
+                    choice = modelChoice, language = language, audioFile = pr.wav,
+                    wavRecorder = wavRecorder, modelDownloader = modelDownloader,
+                    keys = apiKeys, usageTracker = usageTracker,
+                    onStatus = { setStatus(it, Color.GRAY) }, onProgress = { },
+                ).also { pendingRetry = pr.copy(rawText = it) }  // so a cleanup retry won't re-transcribe
+                applyResult(
+                    pr.mode, rawText,
+                    if (pr.mode == MODE_MODIFY) pr.fieldBefore else "",
+                    pr.fieldBefore, llmChoice, apiKeys, cleanupPrompt,
+                )
+                btnCost?.let { c -> tvCostBreakdown?.let { b -> refreshCostViews(c, b) } }
+                clearPendingRetry()
+            } catch (e: CancellationException) {
+                throw e  // keep pendingRetry so the user can try once more
+            } catch (e: Exception) {
+                if (isActive) Toast.makeText(this@VoiceKeyboardService, "Retry failed: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                imeJob = null
+                finishUi()
+            }
+        }
+    }
+
+    /**
      * Stop + run the pipeline. Write => transcribe + cleanup + commit;
      * Modify => transcribe (edit instruction) + LLM-rewrite the field's text.
      */
@@ -448,6 +547,7 @@ class VoiceKeyboardService : InputMethodService() {
         val audioSeconds = (file.length() - 44) / 32000.0
 
         imeJob = serviceScope.launch {
+            var rawSoFar: String? = null   // set once transcription succeeds, for retry
             try {
                 suspend fun transcribeFile(): String = aiProcessor.transcribe(
                     choice = modelChoice,
@@ -479,40 +579,11 @@ class VoiceKeyboardService : InputMethodService() {
                     }
                 } else transcribeFile()
                 liveStream = null
+                rawSoFar = rawText
 
-                val llmFile: File? = if (llmChoice != "OpenAI") {
-                    setStatus("Loading LLM (Local)...", Color.GRAY)
-                    modelDownloader.downloadLlmModel(llmChoice) { } ?: throw Exception("Failed to load local LLM")
-                } else null
-
-                if (mode == MODE_WRITE) {
-                    setStatus("Cleaning up Text...", Color.GRAY)
-                    // Show the raw words while the LLM works, in case they were not previewed.
-                    if (rawText.isNotBlank()) renderLiveText(mode, rawText.trim())
-                    val cleanText = (if (llmChoice == "OpenAI")
-                        aiProcessor.cleanText(rawText, apiKeys.openai, usageTracker, cleanupPrompt)
-                    else aiProcessor.cleanTextLocal(rawText, llmFile!!, cleanupPrompt)).trim()
-                    // commitText replaces the composing (preview) text, if any.
-                    currentInputConnection?.commitText("$cleanText ", 1)
-                    previewText = ""
-                    // Undo twice: first back to the raw transcript, then to before the dictation.
-                    undoStack.addLast(fieldBeforeDictation)
-                    val afterCommit = readFieldText()
-                    val rawTrimmed = rawText.trim()
-                    if (rawTrimmed.isNotEmpty() && rawTrimmed != cleanText) {
-                        val i = afterCommit.lastIndexOf(cleanText)
-                        if (i >= 0) undoStack.addLast(afterCommit.substring(0, i) + rawTrimmed + afterCommit.substring(i + cleanText.length))
-                    }
-                } else {
-                    showTranscript(rawText.trim().ifEmpty { "(nothing heard)" })
-                    setStatus("Applying edit...", Color.GRAY)
-                    val newText = if (llmChoice == "OpenAI")
-                        aiProcessor.modifyText(existingText, rawText, apiKeys.openai, usageTracker)
-                    else aiProcessor.modifyTextLocal(existingText, rawText, llmFile!!)
-                    undoStack.addLast(existingText)
-                    replaceFieldText(newText.trim())
-                }
+                applyResult(mode, rawText, existingText, fieldBeforeDictation, llmChoice, apiKeys, cleanupPrompt)
                 btnCost?.let { c -> tvCostBreakdown?.let { b -> refreshCostViews(c, b) } }
+                clearPendingRetry()
             } catch (e: CancellationException) {
                 abortLiveStream()
                 discardPreview()  // user cancelled: drop the underlined preview too
@@ -520,11 +591,16 @@ class VoiceKeyboardService : InputMethodService() {
                 throw e
             } catch (e: Exception) {
                 if (isActive) {
-                    // Keep whatever the live preview already captured rather than losing it.
-                    if (mode == MODE_WRITE && previewText.isNotEmpty()) {
-                        currentInputConnection?.commitText("$previewText ", 1)
-                        previewText = ""
-                        Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message} (kept live preview text)", Toast.LENGTH_LONG).show()
+                    discardPreview()                       // drop the underlined partial text
+                    if (mode == MODE_MODIFY) hideTranscript()
+                    // Preserve the recording and any transcript-so-far so the user can retry
+                    // without re-speaking (the live WAV is overwritten by the next recording).
+                    val saved = withContext(Dispatchers.IO) {
+                        runCatching { file.copyTo(File(cacheDir, "retry_audio.wav"), overwrite = true) }.getOrNull()
+                    }
+                    if (saved != null) {
+                        pendingRetry = PendingRetry(mode, saved, rawSoFar, fieldBeforeDictation)
+                        Toast.makeText(this@VoiceKeyboardService, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
                     } else {
                         Toast.makeText(this@VoiceKeyboardService, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
                     }
@@ -572,8 +648,8 @@ class VoiceKeyboardService : InputMethodService() {
         val btnMic = layout.findViewById<ImageButton>(R.id.btn_mic)
         val btnDelete = layout.findViewById<ImageButton>(R.id.btn_delete)
         val btnModify = layout.findViewById<ImageButton>(R.id.btn_modify)
-        val btnUndo = layout.findViewById<ImageButton>(R.id.btn_undo)
         val btnCancel = layout.findViewById<ImageButton>(R.id.btn_cancel)
+        val btnRetry = layout.findViewById<ImageButton>(R.id.btn_retry)
         val status = layout.findViewById<TextView>(R.id.tv_status)
         val transcript = layout.findViewById<TextView>(R.id.tv_transcript)
         val cost = layout.findViewById<TextView>(R.id.btn_cost)
@@ -583,8 +659,8 @@ class VoiceKeyboardService : InputMethodService() {
 
         micButton = btnMic
         modifyButton = btnModify
-        undoButton = btnUndo
         cancelButton = btnCancel
+        retryButton = btnRetry
         tvStatus = status
         tvTranscript = transcript
         btnCost = cost
@@ -662,15 +738,10 @@ class VoiceKeyboardService : InputMethodService() {
         btnMic.setOnTouchListener(recordTouch(MODE_WRITE))
         btnModify.setOnTouchListener(recordTouch(MODE_MODIFY))
 
-        btnUndo.setOnClickListener {
-            if (recordMode != null || processing) return@setOnClickListener
-            if (undoStack.isNotEmpty()) replaceFieldText(undoStack.removeLast())
-            updateButtonStates()
-        }
-
         // Cancel the in-flight request via the red X or by tapping the status line.
         btnCancel.setOnClickListener { cancelCurrent() }
         status.setOnClickListener { if (processing) cancelCurrent() }
+        btnRetry.setOnClickListener { retry() }
 
         updateButtonStates()
         return layout
