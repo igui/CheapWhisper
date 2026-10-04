@@ -4,8 +4,12 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.content.Intent
+import androidx.lifecycle.ViewModelProvider
+import com.example.smartnotetaker.transcription.*
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,6 +33,7 @@ import com.whispercpp.whisper.WhisperContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -64,6 +69,7 @@ const val ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/speech-to-text"
 const val ASSEMBLYAI_BASE = "https://api.assemblyai.com/v2"
 
 // --- TRANSCRIPTION PROVIDERS (values persisted as model_choice) ---
+const val PROVIDER_OPENROUTER = "OpenRouter"
 const val PROVIDER_OPENAI = "OpenAI"
 const val PROVIDER_DEEPGRAM = "Deepgram"
 const val PROVIDER_GROQ = "Groq"
@@ -84,6 +90,7 @@ const val DEFAULT_CLEANUP_PROMPT =
 
 // Groq is deliberately not offered: its STT API has no streaming, so no live text.
 val TRANSCRIPTION_PROVIDERS = listOf(
+    PROVIDER_OPENROUTER,
     PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI, PROVIDER_SONIOX,
     PROVIDER_LOCAL_TINY, PROVIDER_LOCAL_BASE, PROVIDER_LOCAL_SMALL,
 )
@@ -95,6 +102,7 @@ val TRANSCRIBE_LANGUAGES = listOf(
     "Auto-detect" to "auto",
     "English" to "en",
     "Spanish" to "es",
+    "Catalan" to "ca",
     "French" to "fr",
     "German" to "de",
     "Italian" to "it",
@@ -116,9 +124,12 @@ data class ApiKeys(
     val elevenLabs: String,
     val assemblyAi: String,
     val soniox: String = "",
+    val openrouter: String = "",
+    val openrouterModel: String = TranscriptionCatalog.DEFAULT,
 ) {
     /** The key required for [choice], or "" for local providers (no key needed). */
     fun keyFor(choice: String): String = when (choice) {
+        PROVIDER_OPENROUTER -> openrouter
         PROVIDER_OPENAI -> openai
         PROVIDER_DEEPGRAM -> deepgram
         PROVIDER_GROQ -> groq
@@ -133,6 +144,7 @@ data class ApiKeys(
 // Paid third-party providers whose usage we meter. Local Whisper / Gemma run
 // on-device and cost nothing, so they are intentionally excluded.
 val COST_PROVIDERS = listOf(
+    PROVIDER_OPENROUTER,
     PROVIDER_OPENAI, PROVIDER_DEEPGRAM, PROVIDER_GROQ, PROVIDER_ELEVENLABS, PROVIDER_ASSEMBLYAI, PROVIDER_SONIOX,
     PROVIDER_LLM,
 )
@@ -151,6 +163,7 @@ object CostEstimator {
 
     /** Published pay-as-you-go transcription rate, USD per minute (0 for on-device). */
     fun usdPerMinute(provider: String): Double = when (provider) {
+        PROVIDER_OPENROUTER -> 0.10 / 60.0
         PROVIDER_OPENAI -> 0.006
         PROVIDER_GROQ -> 0.04 / 60.0          // $0.04/hr
         PROVIDER_DEEPGRAM -> 0.0077
@@ -173,6 +186,7 @@ object CostEstimator {
 
     /** Picker label: "FREE" for on-device, otherwise "est. $X/hr". */
     fun rateLabel(provider: String): String {
+        if (provider == PROVIDER_OPENROUTER) return "Selected model rate; actual cost reported"
         val ratePerHour = usdPerMinute(provider) * 60
         return if (ratePerHour <= 0.0) "FREE" else "est. $" + String.format("%.2f", ratePerHour) + "/hr"
     }
@@ -199,6 +213,7 @@ object CostEstimator {
 
 /** Persists cumulative spend per provider (micro-USD) in plain prefs. */
 class UsageTracker(context: Context) {
+    val appContext: Context = context.applicationContext
     // Device-protected (unencrypted) storage: readable before the first unlock after a
     // reboot, which the direct-boot-aware IME needs. Totals are not secret.
     private val prefs = context.createDeviceProtectedStorageContext()
@@ -221,14 +236,16 @@ class UsageTracker(context: Context) {
         prefs.edit().putLong(provider, getMicros(provider) + micros).apply()
     }
 
-    fun getMicros(provider: String): Long = prefs.getLong(provider, 0L)
+    fun getMicros(provider: String): Long = if (provider == PROVIDER_OPENROUTER) {
+        runCatching { TranscriptionUsage(appContext).total().multiply(java.math.BigDecimal(1000000)).toLong() }.getOrDefault(0L)
+    } else prefs.getLong(provider, 0L)
 
     /** Per-provider spend in display order. */
-    fun byProvider(): List<Pair<String, Long>> = COST_PROVIDERS.map { it to getMicros(it) }
+    fun byProvider(): List<Pair<String, Long>> = COST_PROVIDERS.map { it to getMicros(it) }.filter { it.second > 0L }
 
     fun totalMicros(): Long = COST_PROVIDERS.sumOf { getMicros(it) }
 
-    fun reset() = prefs.edit().clear().putBoolean(MIGRATED_KEY, true).apply()
+    fun reset() { prefs.edit().clear().putBoolean(MIGRATED_KEY, true).apply(); TranscriptionUsage(appContext).reset() }
 
     companion object {
         private const val MIGRATED_KEY = "_migrated_from_ce"
@@ -243,23 +260,16 @@ class UsageTracker(context: Context) {
 }
 
 class MainActivity : ComponentActivity() {
-    // The IME runs in this app's process, so the mic permission must be granted to the app
-    // itself; ask for it as soon as the app is opened.
-    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
-
+    private lateinit var transcription: FileTranscriptionViewModel
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            micPermission.launch(Manifest.permission.RECORD_AUDIO)
-        }
-        setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    SettingsScreen(onBack = { finish() })
-                }
-            }
-        }
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        transcription = ViewModelProvider(this)[FileTranscriptionViewModel::class.java]
+        setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { FileTranscriptionScreen(transcription) } } }
+        if (savedInstanceState == null) transcription.acceptShare(intent)
     }
+    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); transcription.acceptShare(intent); transcription.reloadSettings() }
+    override fun onStart() { super.onStart(); if (::transcription.isInitialized) transcription.reloadSettings() }
 }
 
 class SecureStorage(context: Context) {
@@ -274,6 +284,13 @@ class SecureStorage(context: Context) {
         EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
     )
+
+    fun saveOpenRouterApiKey(key: String) {
+        check(sharedPreferences.edit().putString("openrouter_api_key", key).commit()) { "Could not securely save OpenRouter key" }
+    }
+    fun getOpenRouterApiKey(): String = sharedPreferences.getString("openrouter_api_key", "") ?: ""
+    fun saveOpenRouterModel(model: String) { sharedPreferences.edit().putString("openrouter_model", model).apply() }
+    fun getOpenRouterModel(): String = sharedPreferences.getString("openrouter_model", TranscriptionCatalog.DEFAULT) ?: TranscriptionCatalog.DEFAULT
 
     // --- Per-provider API keys ---
     fun saveOpenAiApiKey(key: String) {
@@ -336,6 +353,8 @@ class SecureStorage(context: Context) {
         elevenLabs = getElevenLabsApiKey(),
         assemblyAi = getAssemblyAiApiKey(),
         soniox = getSonioxApiKey(),
+        openrouter = getOpenRouterApiKey(),
+        openrouterModel = getOpenRouterModel(),
     )
 
     fun saveModelChoice(choice: String) {
@@ -382,11 +401,13 @@ private fun ApiKeyField(
     label: String,
     value: String,
     onValueChange: (String) -> Unit,
+    enabled: Boolean = true,
     status: @Composable ColumnScope.() -> Unit = {},
 ) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
+        enabled = enabled,
         label = { Text(label) },
         singleLine = true,
         visualTransformation = PasswordVisualTransformation(),
@@ -469,6 +490,10 @@ fun SettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val secureStorage = remember { SecureStorage(context) }
     
+    var openRouterKey by remember { mutableStateOf(secureStorage.getOpenRouterApiKey()) }
+    var openRouterSaveError by remember { mutableStateOf("") }
+    var savingSettings by remember { mutableStateOf(false) }
+    val settingsScope = rememberCoroutineScope()
     var openAiKey by remember { mutableStateOf(secureStorage.getOpenAiApiKey()) }
     var deepgramKey by remember { mutableStateOf(secureStorage.getDeepgramApiKey()) }
     var groqKey by remember { mutableStateOf(secureStorage.getGroqApiKey()) }
@@ -486,8 +511,6 @@ fun SettingsScreen(onBack: () -> Unit) {
     var modelExpanded by remember { mutableStateOf(false) }
     var llmExpanded by remember { mutableStateOf(false) }
 
-    val usageTracker = remember { UsageTracker(context) }
-    var costMicros by remember { mutableStateOf(usageTracker.totalMicros()) }
 
     var downloadedModelsSize by remember { mutableStateOf(0L) }
     var downloadedModelsCount by remember { mutableStateOf(0) }
@@ -516,25 +539,48 @@ fun SettingsScreen(onBack: () -> Unit) {
         return String.format("%.1f %s", size / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
     }
 
+    fun saveAndClose() {
+        if (savingSettings) return
+        savingSettings = true
+        openRouterSaveError = ""
+        settingsScope.launch {
+            try {
+                val candidate = openRouterKey.trim()
+                val stored = withContext(Dispatchers.IO) { secureStorage.getOpenRouterApiKey() }
+                if (candidate != stored && candidate.isNotBlank()) {
+                    when (val result = ApiKeyValidator.validate(PROVIDER_OPENROUTER, candidate)) {
+                        ApiKeyValidator.Outcome.Valid -> Unit
+                        is ApiKeyValidator.Outcome.Invalid -> { openRouterSaveError = result.reason; return@launch }
+                        is ApiKeyValidator.Outcome.Unreachable -> { openRouterSaveError = result.reason; return@launch }
+                    }
+                }
+                withContext(Dispatchers.IO) {
+                    if (candidate != stored) secureStorage.saveOpenRouterApiKey(candidate)
+                    secureStorage.saveOpenAiApiKey(openAiKey)
+                    secureStorage.saveDeepgramApiKey(deepgramKey)
+                    secureStorage.saveGroqApiKey(groqKey)
+                    secureStorage.saveElevenLabsApiKey(elevenLabsKey)
+                    secureStorage.saveAssemblyAiApiKey(assemblyAiKey)
+                    secureStorage.saveSonioxApiKey(sonioxKey)
+                    secureStorage.saveTranscribeLanguage(transcribeLanguage)
+                    secureStorage.saveModelChoice(modelChoice)
+                    secureStorage.saveLlmChoice(llmChoice)
+                    secureStorage.saveCleanupPrompt(cleanupPrompt)
+                }
+                onBack()
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { openRouterSaveError = "Could not save settings. Please try again." }
+            finally { savingSettings = false }
+        }
+    }
+    BackHandler { saveAndClose() }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Settings") },
                 navigationIcon = {
-                    IconButton(onClick = {
-                        secureStorage.saveOpenAiApiKey(openAiKey)
-                        secureStorage.saveDeepgramApiKey(deepgramKey)
-                        secureStorage.saveGroqApiKey(groqKey)
-                        secureStorage.saveElevenLabsApiKey(elevenLabsKey)
-                        secureStorage.saveAssemblyAiApiKey(assemblyAiKey)
-                        secureStorage.saveSonioxApiKey(sonioxKey)
-                        secureStorage.saveTranscribeLanguage(transcribeLanguage)
-                        secureStorage.saveModelChoice(modelChoice)
-                        secureStorage.saveLlmChoice(llmChoice)
-                        secureStorage.saveCleanupPrompt(cleanupPrompt)
-                        Log.i("SmartNoteTaker", "Settings Saved. Transcription: $modelChoice ($transcribeLanguage), LLM: $llmChoice")
-                        onBack()
-                    }) {
+                    IconButton(onClick = { saveAndClose() }, enabled = !savingSettings) {
                         Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -565,7 +611,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             // Plain button + popup menu: a DropdownMenu doesn't track its anchor on
             // every scroll frame the way ExposedDropdownMenuBox does (that caused jank).
             // Buttons show just the choice; rates stay in the menus for comparison.
-            SettingRow("Transcription Model") {
+            SettingRow("IME Transcriber (main screen transcriber)") {
                 Box {
                     OutlinedButton(onClick = { modelExpanded = true }) { Text(modelChoice) }
                     DropdownMenu(expanded = modelExpanded, onDismissRequest = { modelExpanded = false }) {
@@ -585,7 +631,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(12.dp))
 
             val selectedLangLabel = TRANSCRIBE_LANGUAGES.firstOrNull { it.second == transcribeLanguage }?.first ?: "Auto-detect"
-            SettingRow("Transcription Language") {
+            SettingRow("IME transcriber lang") {
                 Box {
                     OutlinedButton(onClick = { langExpanded = true }) { Text(selectedLangLabel) }
                     DropdownMenu(expanded = langExpanded, onDismissRequest = { langExpanded = false }) {
@@ -669,6 +715,13 @@ fun SettingsScreen(onBack: () -> Unit) {
             // API key fields: show the one for the selected cloud transcription provider,
             // plus the OpenAI key whenever cloud cleanup (OpenAI) is selected. A key is
             // checked against its provider only when it changes (debounced).
+            val openRouterCheck = rememberKeyCheck(PROVIDER_OPENROUTER, openRouterKey, storedKeys.openrouter)
+            ApiKeyField("OpenRouter API Key", openRouterKey, { openRouterKey = it; openRouterSaveError = "" }, enabled = !savingSettings) {
+                KeyCheckLine("Key", "OpenRouter", openRouterCheck)
+                if (openRouterSaveError.isNotEmpty()) Text(openRouterSaveError, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                if (savingSettings) Text("Saving settings…", style = MaterialTheme.typography.bodySmall)
+            }
+
             val showOpenAiKey = modelChoice == PROVIDER_OPENAI || llmChoice == "OpenAI"
             if (showOpenAiKey) {
                 // With OpenAI cleanup, checking the cleanup model proves the key too.
@@ -730,36 +783,8 @@ fun SettingsScreen(onBack: () -> Unit) {
             Divider()
             Spacer(modifier = Modifier.height(16.dp))
 
-            Text("Usage Cost (third parties)", style = MaterialTheme.typography.titleMedium)
-            val usageRows = usageTracker.byProvider().filter { it.second > 0L }  // omit no-usage providers
-            if (usageRows.isEmpty()) {
-                Text("No usage yet.", style = MaterialTheme.typography.bodyMedium)
-            }
-            usageRows.forEach { (provider, micros) ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("$provider  (${CostEstimator.formatPerHour(provider)})", style = MaterialTheme.typography.bodyMedium)
-                    Text(UsageTracker.formatUsd(micros), style = MaterialTheme.typography.bodyMedium)
-                }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Total", style = MaterialTheme.typography.titleMedium)
-                Text(UsageTracker.formatUsd(costMicros), style = MaterialTheme.typography.titleMedium)
-            }
+            UsageSettingsSection()
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(
-                onClick = {
-                    usageTracker.reset()
-                    costMicros = 0L
-                    android.widget.Toast.makeText(context, "Usage cost reset", android.widget.Toast.LENGTH_SHORT).show()
-                },
-                enabled = costMicros > 0L,
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, disabledContainerColor = Color.LightGray),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Reset Usage Cost")
-            }
         }
     }
 }
@@ -790,6 +815,13 @@ class AIProcessor {
         onStatus: (String) -> Unit,
         onProgress: (Int) -> Unit,
     ): String {
+        if (choice == PROVIDER_OPENROUTER) {
+            val context = usageTracker.appContext
+            val model = TranscriptionCatalog.resolve(TranscriptionCatalog.distinct(TranscriptionCatalog.all(context)), keys.openrouterModel)
+            return TranscriptionEngine(context, OpenRouterApi(client)).transcribe(audioFile, model, language, keys.openrouter) { status ->
+                android.os.Handler(android.os.Looper.getMainLooper()).post { onStatus(status) }
+            }.text
+        }
         val result: Stt = when (choice) {
             PROVIDER_OPENAI -> {
                 onStatus("Transcribing (OpenAI)…")

@@ -25,6 +25,22 @@ class ApiKeyValidatorTest {
         ApiKeyValidator.baseUrlOverride = server.url("/").toString()
     }
 
+    @Test fun `OpenRouter key uses its metadata endpoint and rejects rate limited checks`() {
+        server.enqueue(MockResponse().setBody("""{"data":{"label":"test","is_free_tier":false}}"""))
+        assertEquals(ApiKeyValidator.Outcome.Valid, validate(PROVIDER_OPENROUTER))
+        val request = server.takeRequest(2, TimeUnit.SECONDS)!!
+        assertEquals("/api/v1/key", request.path)
+        assertEquals("Bearer sk-test-key", request.getHeader("Authorization"))
+        server.enqueue(MockResponse().setResponseCode(429))
+        assertTrue(validate(PROVIDER_OPENROUTER) is ApiKeyValidator.Outcome.Invalid)
+    }
+    @Test fun `OpenRouter error responses do not expose provider payloads`() {
+        server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":{"message":"sk-test-key"}}"""))
+        val outcome = validate(PROVIDER_OPENROUTER)
+        assertTrue(outcome is ApiKeyValidator.Outcome.Invalid)
+        assertFalse(outcome.toString().contains("sk-test-key"))
+    }
+
     @After fun tearDown() {
         ApiKeyValidator.baseUrlOverride = null
         server.shutdown()

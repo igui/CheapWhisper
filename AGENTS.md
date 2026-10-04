@@ -3,13 +3,13 @@
 Guide for AI coding agents and new contributors. Read the code before changing it; this file points at where things live.
 
 ## What it is
-Android voice-dictation keyboard (IME); the launcher activity is just the Settings screen. Audio is transcribed by a cloud STT provider or on-device whisper.cpp, then cleaned by an LLM (OpenAI or on-device Gemma via LiteRT-LM). Package `com.example.smartnotetaker`, app label "CheapWhisper", single Gradle module `:app`.
+Android voice-dictation keyboard (IME) and prerecorded-audio transcriber. The launcher hosts file transcription; Settings is a separate screen. Audio is transcribed by a cloud STT provider or on-device whisper.cpp, then cleaned by an LLM (OpenAI or on-device Gemma via LiteRT-LM). Package `com.example.smartnotetaker`, app label "CheapWhisper", single Gradle module `:app`.
 
 ## Project layout
 - `app/build.gradle.kts` — versionName is the single source of truth (`versionCode` derived), compileSdk 34 / minSdk 26, NDK 26.1, ABIs arm64-v8a + x86_64, Compose BOM 2023.10.01, OkHttp 4.12, security-crypto, LiteRT-LM.
 - `app/src/main/cpp/` — `CMakeLists.txt` builds `libwhisper*.so` from `whisper.cpp/` (git submodule, `ggml-org/whisper.cpp`) + `jni.c`; `ai_chat.cpp`, `logging.h`. Kotlin JNI wrapper: `app/src/main/java/com/whispercpp/whisper/LibWhisper.kt` (`WhisperContext`).
 - `app/src/main/java/com/example/smartnotetaker/`
-  - `MainActivity.kt` — the catch-all file (~1100 lines). Top to bottom: endpoint/model constants and `PROVIDER_*` constants, `TRANSCRIBE_LANGUAGES`, `ApiKeys` (+ `keyFor`), `COST_PROVIDERS`, `CostEstimator` (rates), `UsageTracker` (plain prefs, micro-USD), `MainActivity` (hosts `SettingsScreen`, requests RECORD_AUDIO), `SecureStorage` (EncryptedSharedPreferences getters/setters), `SettingsScreen` (Compose), `AIProcessor` (one-shot transcription per provider, local whisper, cleanup/modify LLM calls).
+  - `MainActivity.kt` — the catch-all file (~1100 lines). Top to bottom: endpoint/model constants and `PROVIDER_*` constants, `TRANSCRIBE_LANGUAGES`, `ApiKeys` (+ `keyFor`), `COST_PROVIDERS`, `CostEstimator` (rates), `UsageTracker` (plain prefs, micro-USD), `MainActivity` (hosts `FileTranscriptionScreen` and receives audio shares), `SecureStorage` (EncryptedSharedPreferences getters/setters), `SettingsScreen` (Compose), `AIProcessor` (one-shot transcription per provider, local whisper, cleanup/modify LLM calls).
   - `VoiceKeyboardService.kt` — the IME (`InputMethodService`), classic Views inflated from `res/layout/keyboard_view.xml` (ids: `btn_mic`, `btn_modify`, `btn_delete`, `btn_cancel`, `btn_retry`, `btn_back`, `btn_settings`, `tv_status`, `tv_transcript`, `btn_cost`, `cost_panel`, `tv_cost_breakdown`).
   - `LiveTranscriber.kt` — streaming interface; implemented by `DeepgramStream.kt`, `OpenAiStream.kt`, `ElevenLabsStream.kt`, `AssemblyAiStream.kt`.
   - `WavRecorder.kt` — `AudioRecord` -> WAV in cacheDir; exposes `amplitude`, `pcmBytesWritten`, `lastSpeechByte`, `onPcm` tap, `exportChunk`, `decodeWavToFloatArray`.
@@ -53,7 +53,6 @@ Android voice-dictation keyboard (IME); the launcher activity is just the Settin
 - `cancelCurrent()` aborts a recording or cancels the in-flight job (`imeJob.cancel()`, `liveStream.cancel()`, `aiProcessor.cancelInFlight()`); it is called silently on `onFinishInputView`/`onFinishInput` (focus loss), and on error the preview text already captured is committed rather than lost.
 
 ## Testing
-- No JVM unit tests exist; nothing runs under `./gradlew test`.
 - JVM unit tests in `app/src/test` (Robolectric + MockWebServer): one class per streaming client, a shared `LiveTranscriberContractTest`, `ApiKeyValidatorTest`, `WavRecorderTest`. Run `./gradlew :app:testDebugUnitTest -Pkotlin.compiler.execution.strategy=in-process`. Each stream class takes a trailing `endpoint` constructor parameter and `ApiKeyValidator.baseUrlOverride` exists only so tests can point them at a mock server. Keep these green; add a mock test for any new provider.
 - `LiveProvidersJvmTest` (same source set) hits the real APIs from the JVM using `.env` keys passed as system properties by `app/build.gradle.kts`; skipped when a key is blank. Prefer it over device tests.
 - Live integration tests live in `app/src/androidTest` (instrumented, hit real provider APIs, sample audio in `androidTest/assets/jfk.wav`). Run with `scripts/live-tests.sh` (wraps `:app:connectedDebugAndroidTest`; set `ANDROID_SERIAL` to pick a device). Keys come from a root `.env` (copy `.env.example`); `app/build.gradle.kts` passes them as instrumentation-runner arguments, never compiling them into an APK. Tests for providers with no key are skipped. They need a connected device and spend real money. Never launch them without the user's explicit go-ahead: AGP's connected-test task reinstalls the app and, by default, UNINSTALLS it afterwards, wiping the user's on-device API keys and settings. `scripts/live-tests.sh` passes `-Pandroid.injected.androidTest.leaveApksInstalledAfterRun=true` to prevent that; always run through the script, never the bare gradle task.
@@ -71,3 +70,13 @@ Android voice-dictation keyboard (IME); the launcher activity is just the Settin
 - OpenAI `gpt-5.6-luna` rejects sampling params (temperature etc.); reasoning effort is pinned `low` via `OPENAI_REASONING_EFFORT`.
 - Local model files are large (Gemma ~2.5 GB) and live in `filesDir`; `LocalModelDownloader` follows redirects manually and deletes partial downloads on failure.
 - `keyboard_view.xml` disables child clipping so scaled (mic-level) buttons are not cropped; keep padding if you touch the layout.
+
+## Unified OpenRouter file transcription
+
+- `transcription/` contains the Compose file screen and ViewModel, share/import/Opus decoding, OpenRouter client, model catalog, transcript alignment and usage journal. `assets/openrouter-models.json` is the dated price/WER snapshot; the selector keeps one model per family.
+- Shares automatically import and transcribe with the current saved OpenRouter model/language. Manual imports wait for Transcribe. Cancellation and replacement shares must not submit the superseded recording.
+- OpenRouter keys use `SecureStorage`; the field lives above OpenAI's and is validated before changed keys are saved. The IME can select `PROVIDER_OPENROUTER`, sharing the main screen's chosen model and key. Do not rename existing persisted provider strings.
+- Audio is normalized to 16 kHz mono PCM, uploaded as bounded WAV chunks, and combined with offset timing. Timestamp requests are automatic. Only an explicit unsupported-timing HTTP 400 permits a single text-only fallback.
+- Usage uses `TranscriptionUsage` in device-protected storage. It records server-reported decimal cost and seconds, marks unknown/interrupted requests, and supplies the existing `UsageTracker` OpenRouter bucket without double billing. Usage UI is in Settings and expands by model.
+- Offline checks: `./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug -PofflineTests=true -Pkotlin.compiler.execution.strategy=in-process`. The property excludes the paid JVM test class even if credentials exist.
+- `OpusAudioTest` is a no-network instrumented test using synthetic fixtures. Build both APKs, install with `adb install -r`, then invoke only its class with `am instrument -w -e class com.example.smartnotetaker.transcription.OpusAudioTest com.example.smartnotetaker.test/androidx.test.runner.AndroidJUnitRunner`. Do not use the unrestricted connected-test task, which can run paid tests or uninstall the app.

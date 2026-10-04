@@ -1,0 +1,937 @@
+{
+  "checked": "2026-10-03",
+  "source": "https://openrouter.ai/api/v1/models?output_modalities=transcription",
+  "models": [
+    {
+      "id": "microsoft/mai-transcribe-2",
+      "name": "MAI-Transcribe 2",
+      "publisher": "Microsoft AI",
+      "pricing": {
+        "prompt": "0.1",
+        "completion": "0"
+      },
+      "priceUnit": "hour",
+      "wer": 2.04,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Hours",
+          "price": "0.1",
+          "displayMultiplier": 1,
+          "unitLabel": "/hour"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Azure",
+          "pricing": {
+            "prompt": "0.1",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "microsoft/mai-transcribe-1.5",
+      "name": "MAI-Transcribe 1.5",
+      "publisher": "Microsoft AI",
+      "pricing": {
+        "prompt": "0.36",
+        "completion": "0"
+      },
+      "priceUnit": "hour",
+      "wer": 2.38,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Hours",
+          "price": "0.36",
+          "displayMultiplier": 1,
+          "unitLabel": "/hour"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Azure",
+          "pricing": {
+            "prompt": "0.36",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "google/gemini-3.5-transcribe",
+      "name": "Gemini 3.5 Transcribe",
+      "publisher": "Google",
+      "pricing": {
+        "prompt": "0.000002",
+        "completion": "0.000012"
+      },
+      "priceUnit": "token",
+      "wer": 2.5996,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "token",
+          "sku_label": "Input Price",
+          "price": "0.000002",
+          "displayMultiplier": 1000000,
+          "unitLabel": "/M tokens"
+        },
+        {
+          "kind": "token",
+          "sku_label": "Output Price",
+          "price": "0.000012",
+          "displayMultiplier": 1000000,
+          "unitLabel": "/M tokens"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Google AI Studio",
+          "pricing": {
+            "prompt": "0.000002",
+            "completion": "0.000012",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "mistralai/voxtral-small-24b-2507-stt",
+      "name": "Voxtral Small 24B 2507 STT",
+      "publisher": "Mistral",
+      "pricing": {
+        "prompt": "0.00005",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 2.77,
+      "note": "AA result measured via Mistral; OpenRouter serves this model through DeepInfra.",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.00005",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.00005",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "assemblyai/universal-3-5-pro",
+      "name": "Universal-3.5 Pro",
+      "publisher": "AssemblyAI",
+      "pricing": {
+        "prompt": "0.000125",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 3.02,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.000125",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        },
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds (Prompted)",
+          "price": "0.000138889",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "AssemblyAI",
+          "pricing": {
+            "prompt": "0.000125",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "openai/gpt-transcribe",
+      "name": "GPT Transcribe",
+      "publisher": "OpenAI",
+      "pricing": {
+        "prompt": "0.000075",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 3.31,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.000075",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "OpenAI",
+          "pricing": {
+            "prompt": "0.000075",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "mistralai/voxtral-mini-transcribe",
+      "name": "Voxtral Mini Transcribe",
+      "publisher": "Mistral",
+      "pricing": {
+        "prompt": "0.00005",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 3.59,
+      "note": "2602 model matched to AA Voxtral Mini Transcribe 2.",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.00005",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Mistral",
+          "pricing": {
+            "prompt": "0.00005",
+            "completion": "0",
+            "discount": 0
+          }
+        },
+        {
+          "name": "Mistral",
+          "pricing": {
+            "prompt": "0.000055",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "mistralai/voxtral-mini-3b-2507",
+      "name": "Voxtral Mini 3B 2507",
+      "publisher": "Mistral",
+      "pricing": {
+        "prompt": "0.0000166667",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 3.84,
+      "note": "AA Voxtral Mini, DeepInfra API result.",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0000166667",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.0000166667",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "openai/gpt-4o-transcribe",
+      "name": "GPT-4o Transcribe",
+      "publisher": "OpenAI",
+      "pricing": {
+        "prompt": "0.0000025",
+        "completion": "0.00001"
+      },
+      "priceUnit": "token",
+      "wer": 3.96,
+      "note": "",
+      "defaultTimestamps": false,
+      "timestampsUnavailable": true,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "token",
+          "sku_label": "Input Price",
+          "price": "0.0000025",
+          "displayMultiplier": 1000000,
+          "unitLabel": "/M tokens"
+        },
+        {
+          "kind": "token",
+          "sku_label": "Output Price",
+          "price": "0.00001",
+          "displayMultiplier": 1000000,
+          "unitLabel": "/M tokens"
+        }
+      ],
+      "routes": [
+        {
+          "name": "OpenAI",
+          "pricing": {
+            "prompt": "0.0000025",
+            "completion": "0.00001",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "openai/whisper-1",
+      "name": "Whisper 1",
+      "publisher": "OpenAI",
+      "pricing": {
+        "prompt": "0.0001",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 4.06,
+      "note": "Matched to AA Whisper Large v2 (OpenAI whisper-1).",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0001",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "OpenAI",
+          "pricing": {
+            "prompt": "0.0001",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": true
+    },
+    {
+      "id": "openai/whisper-large-v3",
+      "name": "Whisper Large V3",
+      "publisher": "OpenAI",
+      "pricing": {
+        "prompt": "0.0000075",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 4.07,
+      "note": "AA best model result uses fal.ai; OpenRouter hosts differ. Actual route accuracy may differ.",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0000075",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.0000075",
+            "completion": "0",
+            "discount": 0
+          }
+        },
+        {
+          "name": "Together",
+          "pricing": {
+            "prompt": "0.000025",
+            "completion": "0",
+            "discount": 0
+          }
+        },
+        {
+          "name": "Groq",
+          "pricing": {
+            "prompt": "0.0000308333333333",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "google/chirp-3",
+      "name": "Chirp 3",
+      "publisher": "Google",
+      "pricing": {
+        "prompt": "0.000266666666667",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 4.32,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.000266666666667",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Google",
+          "pricing": {
+            "prompt": "0.000266666666667",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "openai/gpt-4o-mini-transcribe",
+      "name": "GPT-4o Mini Transcribe",
+      "publisher": "OpenAI",
+      "pricing": {
+        "prompt": "0.00000125",
+        "completion": "0.000005"
+      },
+      "priceUnit": "token",
+      "wer": 4.47,
+      "note": "",
+      "defaultTimestamps": false,
+      "timestampsUnavailable": true,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "token",
+          "sku_label": "Input Price",
+          "price": "0.00000125",
+          "displayMultiplier": 1000000,
+          "unitLabel": "/M tokens"
+        },
+        {
+          "kind": "token",
+          "sku_label": "Output Price",
+          "price": "0.000005",
+          "displayMultiplier": 1000000,
+          "unitLabel": "/M tokens"
+        }
+      ],
+      "routes": [
+        {
+          "name": "OpenAI",
+          "pricing": {
+            "prompt": "0.00000125",
+            "completion": "0.000005",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "openai/whisper-large-v3-turbo",
+      "name": "Whisper Large V3 Turbo",
+      "publisher": "OpenAI",
+      "pricing": {
+        "prompt": "0.00000333",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 4.62,
+      "note": "AA result measured via Groq; OpenRouter may choose another host.",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.00000333",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.00000333",
+            "completion": "0",
+            "discount": 0
+          }
+        },
+        {
+          "name": "Groq",
+          "pricing": {
+            "prompt": "0.0000111111111111",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "deepgram/nova-3",
+      "name": "Nova-3",
+      "publisher": "Deepgram",
+      "pricing": {
+        "prompt": "0.0000716666666667",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 5.18,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0000716666666667",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        },
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds (Multilingual)",
+          "price": "0.0000866666666667",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Deepgram",
+          "pricing": {
+            "prompt": "0.0000716666666667",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "qwen/qwen3-asr-flash-2026-02-10",
+      "name": "Qwen3 ASR Flash",
+      "publisher": "Qwen",
+      "pricing": {
+        "prompt": "0.000035",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": 5.8,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": "2026-10-09",
+      "maxChunkSeconds": 30,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.000035",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Alibaba",
+          "pricing": {
+            "prompt": "0.000035",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "x-ai/grok-stt-1.0",
+      "name": "Grok STT 1.0",
+      "publisher": "SpaceXAI",
+      "pricing": {
+        "prompt": "0.0000277777777778",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "Legacy 1.0 alias; upstream now redirects to 2.0. AA historical 1.0 WER 4.03%, current routed version unverified; excluded from ranking.",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0000277777777778",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "xAI",
+          "pricing": {
+            "prompt": "0.0000277777777778",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "meta/muse-voice-transcribe-1.0",
+      "name": "Muse Voice Transcribe 1.0",
+      "publisher": "Meta",
+      "pricing": {
+        "prompt": "0.00005",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.00005",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Meta",
+          "pricing": {
+            "prompt": "0.00005",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "nvidia/nemotron-3.5-asr-streaming-multilingual-0.6b",
+      "name": "Nemotron 3.5 ASR Streaming Multilingual 0.6B",
+      "publisher": "NVIDIA",
+      "pricing": {
+        "prompt": "0.00000333",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.00000333",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.00000333",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "nvidia/parakeet-tdt-0.6b-v3",
+      "name": "Parakeet TDT 0.6B v3",
+      "publisher": "NVIDIA",
+      "pricing": {
+        "prompt": "0.000025",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.000025",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Together",
+          "pricing": {
+            "prompt": "0.000025",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "qwen/qwen3-asr-0.6b",
+      "name": "Qwen3 ASR 0.6B",
+      "publisher": "Qwen",
+      "pricing": {
+        "prompt": "0.00000333",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 30,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.00000333",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.00000333",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "qwen/qwen3-asr-1.7b",
+      "name": "Qwen3 ASR 1.7B",
+      "publisher": "Qwen",
+      "pricing": {
+        "prompt": "0.0000075",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 30,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0000075",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "DeepInfra",
+          "pricing": {
+            "prompt": "0.0000075",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "fish-audio/transcribe-1",
+      "name": "Transcribe 1",
+      "publisher": "Fish Audio",
+      "pricing": {
+        "prompt": "0.0001",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0001",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Fish Audio",
+          "pricing": {
+            "prompt": "0.0001",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    },
+    {
+      "id": "fish-audio/transcribe-1-pro",
+      "name": "Transcribe 1 Pro",
+      "publisher": "Fish Audio",
+      "pricing": {
+        "prompt": "0.0001",
+        "completion": "0"
+      },
+      "priceUnit": "second",
+      "wer": null,
+      "note": "",
+      "defaultTimestamps": true,
+      "timestampsUnavailable": false,
+      "expiration": null,
+      "maxChunkSeconds": 60,
+      "displayPricing": [
+        {
+          "kind": "unit",
+          "sku_label": "Audio Seconds",
+          "price": "0.0001",
+          "displayMultiplier": 1,
+          "unitLabel": "/second"
+        }
+      ],
+      "routes": [
+        {
+          "name": "Fish Audio",
+          "pricing": {
+            "prompt": "0.0001",
+            "completion": "0",
+            "discount": 0
+          }
+        }
+      ],
+      "recommended": false
+    }
+  ]
+}
