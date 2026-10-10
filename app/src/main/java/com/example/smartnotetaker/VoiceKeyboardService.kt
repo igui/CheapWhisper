@@ -31,6 +31,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import java.io.File
+import java.io.IOException
 
 private const val TAG = "VoiceKeyboard"
 
@@ -104,7 +105,13 @@ class VoiceKeyboardService : InputMethodService() {
                     val store = retryStore ?: DictationRetryStore(this@VoiceKeyboardService).also { retryStore = it }
                     store.forEditor(editor, text)
                 }
-                if (!processing && recordMode == null && editorIdentity() == editor && readFieldText() == text) { pendingRetry = saved; finishUi(); maybeRetryOnline() }
+                if (!processing && recordMode == null && editorIdentity() == editor && readFieldText() == text) {
+                    pendingRetry = saved
+                    finishUi()
+                    // A restored recording is an offer, not a fresh failure: show it calmly.
+                    if (saved != null) setStatus(if (saved.waitingForNetwork) "Saved recording — waiting for network, or tap Retry" else "Saved recording — tap Retry", Color.GRAY)
+                    maybeRetryOnline()
+                }
             } catch (e: CancellationException) { throw e }
             catch (_: Exception) { setStatus("Saved recording unavailable", Color.RED) }
         }
@@ -463,14 +470,34 @@ class VoiceKeyboardService : InputMethodService() {
         updateButtonStates()  // lock out the other buttons while recording
     }
 
-    /** Stops the mic and abandons the recording without transcribing it. */
+    /**
+     * Stops the mic without transcribing (focus lost while the button was held). A clip long
+     * enough to be a real dictation is saved for Retry rather than thrown away.
+     */
     private fun abortRecording() {
+        val mode = recordMode
         recordMode = null
         stopChunkedPreview()
         abortLiveStream()
-        wavRecorder.stop()
+        wavRecorder.onPcm = null
+        val file = wavRecorder.stop()
         discardPreview()
         hideTranscript()
+        if (mode == null || file == null || file.length() - 44 < MIN_RECORDING_BYTES || !isUserUnlocked()) return
+        val ss = SecureStorage(this)
+        val keys = ss.getApiKeys()
+        val field = fieldBeforeDictation; val editor = recordingEditor
+        serviceScope.launch {
+            try {
+                val saved = withContext(NonCancellable + Dispatchers.IO) {
+                    val store = retryStore ?: DictationRetryStore(this@VoiceKeyboardService).also { retryStore = it }
+                    store.enqueue(file, mode, field, editor, ss.getModelChoice(), ss.getTranscribeLanguage(), keys.openrouterModel, ss.getLlmChoice(), ss.getCleanupPrompt())
+                }
+                if (pendingRetry == null && editorIdentity() == editor) { pendingRetry = saved; updateButtonStates() }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not save interrupted recording", e)
+            }
+        }
     }
 
     /**
@@ -573,13 +600,20 @@ class VoiceKeyboardService : InputMethodService() {
 
         imeJob = serviceScope.launch {
             try {
-                val rawText = pr.rawText ?: aiProcessor.transcribe(
+                val rawText = pr.rawText?.takeIf { it.isNotBlank() } ?: aiProcessor.transcribe(
                     choice = modelChoice, language = language, audioFile = pr.wav,
                     wavRecorder = wavRecorder, modelDownloader = modelDownloader,
                     keys = apiKeys, usageTracker = usageTracker,
                     onStatus = { setStatus(it, Color.GRAY) }, onProgress = { },
-                ).also { text ->
-                    val updated = pr.copy(rawText = text, waitingForNetwork = false)
+                )
+                if (rawText.isBlank()) {
+                    // Confirmed silence: nothing to insert, so the saved clip is no longer useful.
+                    clearPendingRetry(pr)
+                    Toast.makeText(this@VoiceKeyboardService, "Nothing was heard", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+                if (pr.rawText.isNullOrBlank()) {
+                    val updated = pr.copy(rawText = rawText, waitingForNetwork = false)
                     pendingRetry = updated
                     withContext(Dispatchers.IO) { runCatching { retryStore?.save(updated) } }
                 }
@@ -687,20 +721,35 @@ class VoiceKeyboardService : InputMethodService() {
                 val rawText = if (stream != null) {
                     // Streaming already transcribed everything; just let the provider flush.
                     setStatus("Finishing ($modelChoice)…", Color.GRAY)
-                    try {
-                        val text = stream.finish()
-                        usageTracker.add(modelChoice, CostEstimator.streamingMicros(modelChoice, audioSeconds))
-                        text
+                    val streamed = try {
+                        stream.finish()
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        // Socket died mid-dictation: the WAV still has everything, so
-                        // fall back to the one-shot request.
                         Log.w(TAG, "$modelChoice stream failed, falling back to one-shot", e)
+                        ""
+                    }
+                    if (streamed.isNotBlank()) {
+                        usageTracker.add(modelChoice, CostEstimator.streamingMicros(modelChoice, audioSeconds))
+                        streamed
+                    } else {
+                        // Socket died, or stalled on a dead connection: finish() times out and
+                        // returns nothing rather than throwing. The WAV has everything, so use
+                        // the one-shot request instead of committing an empty transcript.
+                        setStatus("Transcribing ($modelChoice)…", Color.GRAY)
                         transcribeFile()
                     }
                 } else transcribeFile()
                 liveStream = null
+                // Blank even after the one-shot check means the provider heard nothing. Commit
+                // nothing (never a stray space) and drop the saved clip, which would otherwise
+                // sit un-retryable. A dead connection never reaches here: it throws above.
+                if (rawText.isBlank()) {
+                    discardPreview(); if (mode == MODE_MODIFY) hideTranscript()
+                    savedRecording?.let { clearPendingRetry(it) }
+                    Toast.makeText(this@VoiceKeyboardService, "Nothing was heard", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
                 savedRecording = savedRecording?.copy(rawText = rawText)
                 savedRecording?.let { saved ->
                     pendingRetry = saved

@@ -12,10 +12,20 @@ data class PendingDictation(
     val editor: String, val provider: String, val language: String, val openRouterModel: String,
     val llm: String, val cleanupPrompt: String, val waitingForNetwork: Boolean = false
 ) {
-    fun matches(editor: String, text: String): Boolean = this.editor == editor && fieldBefore == text
+    /**
+     * Write needs only the same field (the user may have typed since); Modify also needs the
+     * text it was asked to rewrite to be unchanged, since the edit is applied to that text.
+     */
+    fun matches(editor: String, text: String): Boolean =
+        this.editor == editor && (mode != "modify" || fieldBefore == text)
 }
 
 class DictationRetryStore(context: Context) {
+    companion object {
+        /** Saved recordings older than this are dropped on the next read (audio age = wav mtime). */
+        const val MAX_AGE_MS = 24L * 60 * 60 * 1000
+        private val lock = Any()
+    }
     private val directory = File(context.noBackupFilesDir, "pending-dictations").apply { mkdirs() }
     private val index = AtomicFile(File(directory, "index.json"))
     private fun read(): List<PendingDictation> {
@@ -30,7 +40,13 @@ class DictationRetryStore(context: Context) {
             PendingDictation(id, row.getString("mode"), File(directory, "$id.wav"), row.optString("raw").takeIf { !row.isNull("raw") },
                 row.getString("field"), row.getString("editor"), row.getString("provider"), row.getString("language"),
                 row.getString("model"), row.getString("llm"), row.getString("prompt"), row.optBoolean("offline"))
-        }.getOrNull() }.filter { it.wav.isFile }
+        }.getOrNull() }.filter { it.wav.isFile }.let { live ->
+            // Expire old rows so a failure from days ago does not haunt every keyboard open.
+            val cutoff = System.currentTimeMillis() - MAX_AGE_MS
+            val (expired, fresh) = live.partition { it.wav.lastModified() < cutoff }
+            if (expired.isNotEmpty()) { expired.forEach { it.wav.delete() }; runCatching { write(fresh) } }
+            fresh
+        }
     }
     private fun write(rows: List<PendingDictation>) {
         val json = JSONArray(rows.map { row -> JSONObject().put("id", row.id).put("mode", row.mode)
@@ -42,8 +58,9 @@ class DictationRetryStore(context: Context) {
         catch (e: Exception) { index.failWrite(output); throw e }
     }
     fun first(): PendingDictation? = synchronized(lock) { read().firstOrNull() }
+    /** The saved dictation for exactly this field and text, or null. Never another field's. */
     fun forEditor(editor: String, text: String): PendingDictation? = synchronized(lock) {
-        val rows = read(); rows.firstOrNull { it.matches(editor, text) } ?: rows.firstOrNull()
+        read().firstOrNull { it.matches(editor, text) }
     }
     fun enqueue(source: File, mode: String, field: String, editor: String, provider: String, language: String,
         model: String, llm: String, prompt: String): PendingDictation = synchronized(lock) {
@@ -58,5 +75,4 @@ class DictationRetryStore(context: Context) {
         val rows = read(); write(rows.map { if (it.id == row.id) row else it })
     }
     fun remove(row: PendingDictation) = synchronized(lock) { write(read().filter { it.id != row.id }); row.wav.delete(); Unit }
-    companion object { private val lock = Any() }
 }
